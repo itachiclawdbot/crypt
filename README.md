@@ -1,0 +1,2 @@
+# crypt
+Crypto Trading bot
