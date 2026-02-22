@@ -270,3 +270,40 @@ Rollout recommendation:
 4. Forecast + cost/confidence sizing
 5. Dashboard/alerts v2
 6. Keep Phase-1 fallback until burn-in passes
+
+---
+
+## 10) Required skills, APIs, and approvals (Phase-1B readiness checklist)
+
+### 10.1 External APIs / credentials needed
+1. **Crypto.com market data access**
+   - REST/WebSocket endpoints for instruments, tickers, OHLCV, orderbook, trades.
+2. **Telegram bot credentials**
+   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` for structured alerts/digests.
+3. **X API credentials (optional but preferred)**
+   - If unavailable, Phase-1B falls back to Reddit + compliant web/RSS sources.
+4. **Reddit API credentials**
+   - Required for social fallback ingestion.
+5. **Optional discovery feed API** (CoinGecko-like watchlist metadata).
+
+### 10.2 Infrastructure / storage approvals
+- Permission to create local data lake directories for Parquet/DuckDB.
+- Retention policy approval for raw social/news text and market snapshots.
+- Approval for periodic network calls at configured polling frequencies.
+
+### 10.3 Compliance and source policy approvals
+- Explicit confirmation of **no scraping** policy for protected sources.
+- Confirmation of acceptable source list (RSS/blog/exchange announcements/X/Reddit).
+- Approval for storing source links/IDs in audit logs (`alpha_source`, `source_ref`).
+
+### 10.4 Optional OpenClaw skills that may help implementation
+(These are convenience skills, not strict blockers.)
+- `playwright-scraper-skill` **not required** for current policy path (static fetch + APIs only).
+- `summarize` optional for digest-quality briefing generation.
+- `automation-workflows` optional for orchestration patterns.
+
+### 10.5 Final go-live approvals needed before coding Stage-2+
+- Confirm API keys provisioned (Crypto.com, Telegram, X/Reddit as applicable).
+- Confirm storage/retention policy.
+- Confirm alert recipients + severity routing.
+- Confirm kill-switch operational semantics (`STOP_SIGNAL` path and halt behavior).
