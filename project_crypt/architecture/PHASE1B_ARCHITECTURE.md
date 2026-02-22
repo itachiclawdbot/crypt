@@ -1,0 +1,175 @@
+# Project Crypt — Phase-1B Architecture Plan
+
+Last updated: 2026-02-23 (Asia/Singapore)
+Status: **Planned + partially implemented (shadow mode only, no live execution)**
+
+---
+
+## 1) Executive Summary
+
+Phase-1B upgrades Project Crypt from a single gate smoke-test into a **continuous multi-source alpha aggregation + forecasting system**.
+
+It remains **paper/shadow only**:
+- no live order placement,
+- no autonomous trading,
+- full audit logging and replayability.
+
+Core intent:
+1. discover small-cap/micro-cap opportunities,
+2. validate with cross-source triangulation,
+3. gate with strict risk/eligibility/cost constraints,
+4. log every decision path end-to-end.
+
+---
+
+## 2) Target Architecture (Phase-1B)
+
+### 2.1 Data flow
+Ingestion (market + discovery + news/social)  
+→ normalization  
+→ feature generation  
+→ forecast ensemble  
+→ proposal candidate  
+→ multi-layer gating  
+→ proposal/risk logs + alerts + dashboards.
+
+### 2.2 Source priority (current strategy)
+1. **Crypto.com** (primary market/account context)
+2. **CoinGecko** (trending/new-listing signals where allowed)
+3. **CoinMarketCap** (market cap/rankings)
+4. **DEX Screener** (fallback discovery + boosted signals)
+5. **CryptoPanic + Free-Crypto-News** (headline/sentiment intelligence)
+6. **X/Reddit** (planned; currently disabled/degraded due API/relay constraints)
+
+### 2.3 Control-plane vs data-plane
+- **SQLite** for audit/control logs (`risk_log`, `proposal_log`, health/incidents/eval).
+- **Parquet/DuckDB** planned for high-volume artifacts (raw texts/orderbook/features/forecasts).
+- SQLite stores references (`features_ref`, `model_ref`) to heavy artifacts.
+
+---
+
+## 3) Decision System (Final Gate Stack)
+
+### Layer 0 — Safety gates (hard stop)
+- kill switch file present,
+- stale market feed,
+- missing features window,
+- model unavailable,
+- circuit breaker open,
+- global DD breach.
+
+### Layer 1 — Eligibility gates (small-cap protection)
+- min listing age,
+- min 24h volume,
+- max spread bps,
+- min top-book depth,
+- min trade cadence,
+- anomaly checks (wick/gap/depth divergence).
+
+### Layer 2 — Alpha/signal gates
+- hype score + sentiment polarity threshold,
+- triangulation confidence (cross-source alignment),
+- optional boost flag logic.
+
+### Layer 3 — Portfolio/risk gates
+- daily/hourly drawdown caps,
+- consecutive losses cap,
+- max concurrent positions,
+- concentration and churn caps,
+- cost gate: expected edge net of fees/spread/slippage.
+
+### Layer 4 — Sizing and uncertainty
+- base risk budget + capped quarter-Kelly,
+- confidence/uncertainty scaling,
+- small-cap volatility scalar.
+
+### Layer 5 — Drift/execution sanity (paper)
+- proposal price vs current price tolerance.
+
+---
+
+## 4) Migration Map: Phase-1 → Phase-1B
+
+## 4.1 Already migrated / in place
+1. **Core risk gate foundation** (Phase-1 RiskManager)
+2. **SQLite logging baseline** (`risk_log`, `trade_log`)
+3. **Telegram notification plumbing**
+4. **Background worker pattern** (continuous loops)
+5. **Live dashboard capability** (terminal UI pattern)
+6. **Phase-2 shadow aggregator implemented** using working sources:
+   - `phase2_alpha_aggregator.py`
+   - `phase2_monitor_notifier.py`
+   - `phase2_ops_dashboard.py`
+7. **Hourly Telegram monitoring digest** for fetch/trend updates.
+
+## 4.2 Partially migrated
+1. Multi-source ingestion + triangulation in `intel_cache` ✅
+2. Source health logging ✅
+3. Current job/state tracking (`phase2_status.json`) ✅
+4. Potential-buy watch tagging (`triangulated_alpha`) ✅
+5. Full eligibility/risk/cost layered gate routing ❌ (design complete, full code pending)
+6. Forecast/model loop + calibration/drift ❌ (pending)
+7. Artifact lake (Parquet/DuckDB) ❌ (pending)
+
+## 4.3 Not yet migrated (planned)
+- Full `proposal_log`, `model_eval_log`, `incident_log`, `universe_log` rollout.
+- Forecast ensemble and confidence quantiles.
+- Model reweighting/retrain triggers.
+- X/Reddit compliant ingestion connectors.
+
+---
+
+## 5) Current Runtime Components
+
+- `phase2_alpha_aggregator.py`
+  - 300s poll cycle (jittered)
+  - ingests sources listed above
+  - writes `intel_cache` and `source_health_log`
+  - computes triangulated signals
+  - updates status JSON for UI
+
+- `phase2_monitor_notifier.py`
+  - hourly Telegram summary:
+    - fetch volume,
+    - trends,
+    - potential buys under watch,
+    - source health.
+
+- `phase2_ops_dashboard.py`
+  - displays:
+    - current job and state,
+    - last cycle summary,
+    - latest candidate symbols,
+    - source health snapshots,
+    - worker process status.
+
+---
+
+## 6) Branching / Repository State
+
+- `phase1-baseline`: stable Phase-1 code + README.
+- `phase2-working`: active shadow intelligence implementation + README + ops scripts.
+
+Phase-1B design docs:
+- `project_crypt/PHASE1B_BLUEPRINT.md`
+- `project_crypt/architecture/PHASE1B_ARCHITECTURE.md` (this document)
+
+---
+
+## 7) Next Implementation Steps (recommended)
+
+1. DB migration script for full Phase-1B schema.
+2. Integrate multi-layer gate engine (safety→eligibility→risk→cost→sizing).
+3. Add proposal lifecycle logs (`candidate_rejected_pre_proposal`, `proposal_log`, `risk_log` stage detail).
+4. Introduce feature store + forecast scaffold.
+5. Add drift/calibration evaluation jobs.
+6. Enable X/Reddit once compliant API or relay path is stable.
+
+---
+
+## 8) Guardrails
+
+- Shadow mode only until explicit live-trading approval.
+- No ToS-violating scraping route.
+- Kill-switch remains hard-stop at highest priority.
+- All important actions must be auditable in local logs.
