@@ -6,6 +6,7 @@ import os
 import random
 import sqlite3
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 import requests
@@ -19,6 +20,9 @@ COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY")
 DEX_SCREENER_BASE_URL = os.getenv("DEX_SCREENER_BASE_URL", "https://api.dexscreener.com")
 DEX_LATEST_PROFILES_ENDPOINT = os.getenv("DEX_LATEST_PROFILES_ENDPOINT", "/token-profiles/latest/v1")
 DEX_BOOSTED_TOKENS_ENDPOINT = os.getenv("DEX_BOOSTED_TOKENS_ENDPOINT", "/token-boosts/latest/v1")
+TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
+MIN_ACTIONABLE_SCORE = float(os.getenv("PHASE2_MIN_ACTIONABLE_SCORE", "70"))
+MIN_ELIGIBLE_SCORE = float(os.getenv("PHASE2_MIN_ELIGIBLE_SCORE", "45"))
 
 
 class Source:
@@ -28,6 +32,8 @@ class Source:
     DEX = "dexscreener"
     CRYPTOPANIC = "cryptopanic"
     FREE_NEWS = "free-crypto-news"
+    X = "x"
+    REDDIT = "reddit"
     SYSTEM = "system"
 
 
@@ -86,6 +92,52 @@ def init_tables() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_funnel_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                discovered_total INTEGER NOT NULL,
+                mapped_to_venue_total INTEGER NOT NULL,
+                eligible_total INTEGER NOT NULL,
+                alpha_pass_total INTEGER NOT NULL,
+                risk_pass_total INTEGER NOT NULL,
+                cost_pass_total INTEGER NOT NULL,
+                proposed_total INTEGER NOT NULL,
+                reasons_json TEXT,
+                sources_present_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_reject_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT,
+                stage TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                metrics_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS universe_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                eligibility_score REAL,
+                alpha_score REAL,
+                confidence REAL,
+                status TEXT NOT NULL,
+                deny_stage TEXT,
+                deny_reason TEXT,
+                metrics_json TEXT,
+                sources_present_json TEXT
+            )
+            """
+        )
 
 
 def put_signal(symbol: str | None, source: str, signal_type: str, payload: dict, conviction: str = "watch") -> None:
@@ -127,8 +179,7 @@ def ingest_cryptocom() -> set[str]:
         for r in rows[:2000]:
             name = str(r.get("instrument_name", ""))
             if name.endswith("_USDT"):
-                sym = name.split("_")[0].upper()
-                symbols.add(sym)
+                symbols.add(name.split("_")[0].upper())
         put_signal(None, Source.CRYPTOCOM, "instruments_snapshot", {"count": len(rows)})
         log_source_health(Source.CRYPTOCOM, "OK", int((time.time() - t0) * 1000), len(rows))
     except Exception as e:
@@ -171,7 +222,7 @@ def ingest_cmc() -> set[str]:
             sym = str(row.get("symbol", "")).upper()
             if sym:
                 out.add(sym)
-                put_signal(sym, Source.CMC, "ranking", {"cmc_rank": row.get("cmc_rank"), "market_cap": row.get("quote", {}).get("USD", {}).get("market_cap")})
+                put_signal(sym, Source.CMC, "ranking", {"cmc_rank": row.get("cmc_rank")})
         log_source_health(Source.CMC, "OK", int((time.time() - t0) * 1000), len(rows))
     except Exception as e:
         put_signal(None, Source.CMC, "ingest_error", {"error": str(e)})
@@ -179,10 +230,11 @@ def ingest_cmc() -> set[str]:
     return out
 
 
-def ingest_dex() -> tuple[set[str], set[str]]:
+def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
     t0 = time.time()
     boosted: set[str] = set()
     latest: set[str] = set()
+    symbol_metrics: dict[str, dict] = {}
     try:
         l = get_json(_norm_url(DEX_LATEST_PROFILES_ENDPOINT))
         b = get_json(_norm_url(DEX_BOOSTED_TOKENS_ENDPOINT))
@@ -192,6 +244,8 @@ def ingest_dex() -> tuple[set[str], set[str]]:
             sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
             if sym:
                 latest.add(sym)
+                vol = float(row.get("volume") or row.get("volume24h") or 0)
+                symbol_metrics.setdefault(sym, {})["volume24h"] = max(vol, symbol_metrics.get(sym, {}).get("volume24h", 0))
                 put_signal(sym, Source.DEX, "latest_profile", {"entry": row})
         for row in b_rows[:400]:
             sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
@@ -202,10 +256,11 @@ def ingest_dex() -> tuple[set[str], set[str]]:
     except Exception as e:
         put_signal(None, Source.DEX, "ingest_error", {"error": str(e)})
         log_source_health(Source.DEX, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
-    return latest, boosted
+    return latest, boosted, symbol_metrics
 
 
-def ingest_news() -> None:
+def ingest_news() -> int:
+    total_hits = 0
     for source, url in [
         (Source.CRYPTOPANIC, "https://cryptopanic.com/news/"),
         (Source.FREE_NEWS, "https://freecryptonews.com/"),
@@ -214,26 +269,121 @@ def ingest_news() -> None:
         try:
             html = get_text(url, headers={"User-Agent": "Mozilla/5.0"})
             bullish_hits = sum(1 for w in ["surge", "breakout", "bull", "rally", "soar", "uptrend", "listing"] if w in html.lower())
+            total_hits += bullish_hits
             put_signal(None, source, "headline_scan", {"bullish_keyword_hits": bullish_hits, "bytes": len(html)})
             log_source_health(source, "OK", int((time.time() - t0) * 1000), 1)
         except Exception as e:
             put_signal(None, source, "ingest_error", {"error": str(e)})
             log_source_health(source, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
+    return total_hits
 
 
-def fuse_signals(cg: set[str], dex_latest: set[str], dex_boosted: set[str], crypto_symbols: set[str]) -> None:
-    triangulated = cg.intersection(dex_latest)
-    for sym in sorted(triangulated):
-        listed = sym in crypto_symbols
-        conviction = "high" if listed else "watchlist"
-        if sym in dex_boosted:
-            conviction = "moonshot" if listed else "watchlist"
-        put_signal(sym, Source.SYSTEM, "triangulated_alpha", {
-            "coingecko_trending": True,
-            "dex_volume_profile": True,
-            "dex_boosted": sym in dex_boosted,
-            "crypto_com_listed": listed,
-        }, conviction=conviction)
+def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int) -> dict:
+    x_on = bool(os.getenv("X_BEARER_TOKEN") or os.getenv("X_API_KEY"))
+    reddit_on = bool(os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET"))
+    return {
+        Source.COINGECKO: len(cg) > 0,
+        Source.CMC: len(cmc) > 0,
+        Source.DEX: len(dex_latest) > 0,
+        Source.CRYPTOPANIC: news_hits >= 0,
+        Source.FREE_NEWS: news_hits >= 0,
+        Source.X: x_on,
+        Source.REDDIT: reddit_on,
+    }
+
+
+def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str], dex_boosted: set[str], mapped: bool, sources_present: dict) -> tuple[float, float, dict]:
+    base_weights = {
+        "market": 35.0,
+        "liquidity": 25.0,
+        "news": 20.0,
+        "social": 20.0,
+    }
+    social_available = sources_present.get(Source.X) or sources_present.get(Source.REDDIT)
+    if not social_available:
+        base_weights["news"] += 10.0
+        base_weights["market"] += 10.0
+        base_weights["social"] = 0.0
+
+    score = 0.0
+    market_points = 0.0
+    if symbol in cg:
+        market_points += 20.0
+    if symbol in cmc:
+        market_points += 15.0
+    score += min(base_weights["market"], market_points)
+
+    liquidity_points = 10.0 if symbol in dex_latest else 0.0
+    liquidity_points += 15.0 if symbol in dex_boosted else 0.0
+    score += min(base_weights["liquidity"], liquidity_points)
+
+    news_points = 8.0 if symbol in cg else 0.0
+    news_points += 12.0 if symbol in dex_boosted else 0.0
+    score += min(base_weights["news"], news_points)
+
+    social_points = 0.0
+    if social_available:
+        social_points = 8.0 if symbol in cg else 0.0
+        social_points += 12.0 if symbol in dex_boosted else 0.0
+        score += min(base_weights["social"], social_points)
+
+    confidence = max(0.05, min(0.99, score / 100.0))
+    if not mapped:
+        confidence *= 0.7
+
+    return score, confidence, {"weights": base_weights, "market_points": market_points, "liquidity_points": liquidity_points, "news_points": news_points, "social_points": social_points}
+
+
+def log_reject(symbol: str, stage: str, reason: str, metrics: dict) -> None:
+    with db() as c:
+        c.execute(
+            "INSERT INTO candidate_reject_log (ts,symbol,stage,reason,metrics_json) VALUES (?,?,?,?,?)",
+            (utc_now(), symbol, stage, reason, json.dumps(metrics, default=str)),
+        )
+
+
+def log_universe_state(symbol: str, eligibility_score: float, alpha_score: float, confidence: float, status: str, deny_stage: str | None, deny_reason: str | None, metrics: dict, sources_present: dict) -> None:
+    with db() as c:
+        c.execute(
+            """
+            INSERT INTO universe_state (ts,symbol,eligibility_score,alpha_score,confidence,status,deny_stage,deny_reason,metrics_json,sources_present_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                utc_now(),
+                symbol,
+                eligibility_score,
+                alpha_score,
+                confidence,
+                status,
+                deny_stage,
+                deny_reason,
+                json.dumps(metrics, default=str),
+                json.dumps(sources_present, default=str),
+            ),
+        )
+
+
+def log_funnel(discovered: int, mapped: int, eligible: int, alpha_pass: int, risk_pass: int, cost_pass: int, proposed: int, top_reasons: list[tuple[str, int]], sources_present: dict) -> None:
+    with db() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_funnel_log (ts,discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,reasons_json,sources_present_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                utc_now(),
+                discovered,
+                mapped,
+                eligible,
+                alpha_pass,
+                risk_pass,
+                cost_pass,
+                proposed,
+                json.dumps(top_reasons, default=str),
+                json.dumps(sources_present, default=str),
+            ),
+        )
 
 
 def run_cycle() -> dict:
@@ -247,22 +397,143 @@ def run_cycle() -> dict:
     cmc = ingest_cmc()
 
     write_status({"state": "running", "job": "ingest_dex"})
-    dex_latest, dex_boosted = ingest_dex()
+    dex_latest, dex_boosted, dex_metrics = ingest_dex()
 
     write_status({"state": "running", "job": "ingest_news"})
-    ingest_news()
+    news_hits = ingest_news()
 
-    write_status({"state": "running", "job": "fuse_signals"})
-    fuse_signals(cg, dex_latest, dex_boosted, crypto_symbols)
+    sources_present = source_availability(cg, cmc, dex_latest, news_hits)
+    discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted))
+
+    mapped_count = 0
+    eligible_count = 0
+    alpha_pass_count = 0
+    risk_pass_count = 0
+    cost_pass_count = 0
+    proposed_count = 0
+    reject_counter: Counter = Counter()
+
+    watchlist: list[dict] = []
+    eligible_list: list[dict] = []
+    actionable_list: list[dict] = []
+
+    dynamic_min_volume = 100000.0
+
+    for sym in discovered:
+        mapped = sym in crypto_symbols
+        if mapped:
+            mapped_count += 1
+
+        volume_24h = float(dex_metrics.get(sym, {}).get("volume24h", 0.0))
+        eligibility_score = 0.0
+        deny_stage = None
+        deny_reason = None
+
+        if mapped:
+            eligibility_score += 40
+        if volume_24h >= dynamic_min_volume:
+            eligibility_score += 35
+        if sym in dex_latest:
+            eligibility_score += 25
+
+        alpha_score, confidence, alpha_dbg = weighted_alpha(sym, cg, cmc, dex_latest, dex_boosted, mapped, sources_present)
+
+        status = "WATCH"
+        if not mapped:
+            deny_stage = "mapping"
+            deny_reason = "not-tradable-on-crypto-com"
+            reject_counter[deny_reason] += 1
+            log_reject(sym, deny_stage, deny_reason, {"mapped": mapped})
+            status = "DENIED"
+        elif eligibility_score < MIN_ELIGIBLE_SCORE:
+            deny_stage = "eligibility"
+            deny_reason = "eligibility-score-too-low"
+            reject_counter[deny_reason] += 1
+            log_reject(sym, deny_stage, deny_reason, {"eligibility_score": eligibility_score, "volume_24h": volume_24h})
+            status = "WATCH"
+        else:
+            eligible_count += 1
+            if alpha_score < MIN_ACTIONABLE_SCORE:
+                deny_stage = "alpha"
+                deny_reason = "alpha-score-below-threshold"
+                reject_counter[deny_reason] += 1
+                log_reject(sym, deny_stage, deny_reason, {"alpha_score": alpha_score, "confidence": confidence})
+                status = "ELIGIBLE"
+            else:
+                alpha_pass_count += 1
+                spread_cost_bps = 20.0 if sym in dex_boosted else 30.0
+                expected_edge_bps = alpha_score * 0.45
+                if expected_edge_bps - spread_cost_bps < 10.0:
+                    deny_stage = "cost"
+                    deny_reason = "net-edge-too-low"
+                    reject_counter[deny_reason] += 1
+                    log_reject(sym, deny_stage, deny_reason, {"expected_edge_bps": expected_edge_bps, "spread_cost_bps": spread_cost_bps})
+                    status = "ELIGIBLE"
+                else:
+                    cost_pass_count += 1
+                    risk_block = confidence < 0.55
+                    if risk_block:
+                        deny_stage = "risk"
+                        deny_reason = "confidence-too-low"
+                        reject_counter[deny_reason] += 1
+                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence})
+                        status = "ELIGIBLE"
+                    else:
+                        risk_pass_count += 1
+                        proposed_count += 1
+                        status = "ACTIONABLE"
+                        put_signal(sym, Source.SYSTEM, "actionable_candidate", {"alpha_score": alpha_score, "confidence": confidence, "target_notional": TARGET_NOTIONAL_USDT}, conviction="high")
+
+        item = {
+            "symbol": sym,
+            "status": status,
+            "eligibility_score": round(eligibility_score, 2),
+            "alpha_score": round(alpha_score, 2),
+            "confidence": round(confidence, 3),
+            "mapped": mapped,
+            "deny_stage": deny_stage,
+            "deny_reason": deny_reason,
+        }
+        watchlist.append(item)
+        if status in {"ELIGIBLE", "ACTIONABLE"}:
+            eligible_list.append(item)
+        if status == "ACTIONABLE":
+            actionable_list.append(item)
+
+        log_universe_state(sym, eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {"volume_24h": volume_24h, **alpha_dbg}, sources_present)
+
+    top_reasons = reject_counter.most_common(8)
+    log_funnel(
+        discovered=len(discovered),
+        mapped=mapped_count,
+        eligible=eligible_count,
+        alpha_pass=alpha_pass_count,
+        risk_pass=risk_pass_count,
+        cost_pass=cost_pass_count,
+        proposed=proposed_count,
+        top_reasons=top_reasons,
+        sources_present=sources_present,
+    )
+
+    watch_top = sorted(watchlist, key=lambda x: x["alpha_score"], reverse=True)[:10]
+    eligible_top = sorted(eligible_list, key=lambda x: x["alpha_score"], reverse=True)[:10]
+    actionable_top = sorted(actionable_list, key=lambda x: x["alpha_score"], reverse=True)[:5]
 
     summary = {
-        "crypto_symbols": len(crypto_symbols),
-        "coingecko_trending": len(cg),
-        "cmc_ranked": len(cmc),
-        "dex_latest": len(dex_latest),
-        "dex_boosted": len(dex_boosted),
-        "triangulated": len(cg.intersection(dex_latest)),
+        "discovered_total": len(discovered),
+        "mapped_to_venue_total": mapped_count,
+        "eligible_total": eligible_count,
+        "alpha_pass_total": alpha_pass_count,
+        "risk_pass_total": risk_pass_count,
+        "cost_pass_total": cost_pass_count,
+        "proposed_total": proposed_count,
+        "top_reject_reasons": top_reasons,
+        "sources_present": sources_present,
+        "watchlist_top": watch_top,
+        "eligible_top": eligible_top,
+        "actionable_top": actionable_top,
     }
+
     write_status({"state": "idle", "job": "sleeping", "last_cycle_summary": summary})
     return summary
 
