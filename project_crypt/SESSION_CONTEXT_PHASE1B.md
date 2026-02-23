@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 08:12 SGT
+Last updated: 2026-02-23 08:50 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -111,6 +111,10 @@ X/Reddit direct ingestion:
   - sources-present map,
   - top watch/eligible/actionable,
   - top reject reasons.
+- Periodic analytics layer added in notifier (6h rolling):
+  - computes stage conversion rates (mapping, eligibility, alpha, risk, cost, proposal),
+  - detects current bottleneck stage,
+  - attaches a tactical recommendation in Telegram digest for the next tuning focus.
 - `phase2_ops_dashboard.py`: displays funnel stages, top reject reasons, top watch/eligible/actionable, and kill-switch flag.
 
 ---

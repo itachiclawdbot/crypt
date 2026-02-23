@@ -15,9 +15,72 @@ def db() -> sqlite3.Connection:
     return c
 
 
+def _safe_ratio(num: float, den: float) -> float:
+    if den <= 0:
+        return 0.0
+    return num / den
+
+
+def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
+    cur.execute(
+        """
+        select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total
+        from candidate_funnel_log
+        where ts >= ?
+        order by id desc
+        limit 72
+        """,
+        (since_6h,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return "none", "no-funnel-data"
+
+    discovered = sum(int(r["discovered_total"]) for r in rows)
+    mapped = sum(int(r["mapped_to_venue_total"]) for r in rows)
+    eligible = sum(int(r["eligible_total"]) for r in rows)
+    alpha = sum(int(r["alpha_pass_total"]) for r in rows)
+    risk = sum(int(r["risk_pass_total"]) for r in rows)
+    cost = sum(int(r["cost_pass_total"]) for r in rows)
+    proposed = sum(int(r["proposed_total"]) for r in rows)
+
+    mapping_rate = _safe_ratio(mapped, discovered)
+    eligible_rate = _safe_ratio(eligible, mapped)
+    alpha_rate = _safe_ratio(alpha, eligible)
+    risk_rate = _safe_ratio(risk, alpha)
+    cost_rate = _safe_ratio(cost, risk)
+    proposed_rate = _safe_ratio(proposed, cost)
+
+    stage_rates = {
+        "mapping": mapping_rate,
+        "eligibility": eligible_rate,
+        "alpha": alpha_rate,
+        "risk": risk_rate,
+        "cost": cost_rate,
+        "proposal": proposed_rate,
+    }
+    bottleneck_stage = min(stage_rates, key=stage_rates.get)
+
+    recommendation = {
+        "mapping": "Expand symbol mapping aliases and venue-availability map first.",
+        "eligibility": "Tune liquidity gates using percentile thresholds tied to target notional.",
+        "alpha": "Rebalance alpha weights / lower hard alpha cutoff slightly when social is missing.",
+        "risk": "Inspect confidence calibration and cooldown logic for excessive denials.",
+        "cost": "Adjust min net-edge gate or improve spread/slippage estimation.",
+        "proposal": "Inspect final proposal constraints (drift/notional/cooldown) for over-filtering.",
+    }[bottleneck_stage]
+
+    analysis_txt = (
+        f"6h_rates mapping={mapping_rate:.2f} elig={eligible_rate:.2f} alpha={alpha_rate:.2f} "
+        f"risk={risk_rate:.2f} cost={cost_rate:.2f} proposal={proposed_rate:.2f}; bottleneck={bottleneck_stage}"
+    )
+    return analysis_txt, recommendation
+
+
 def hourly_summary() -> str:
     now = datetime.now(timezone.utc)
     since = (now - timedelta(hours=1)).isoformat()
+    since_6h = (now - timedelta(hours=6)).isoformat()
     with db() as c:
         cur = c.cursor()
         cur.execute("select count(*) c from intel_cache where ts >= ?", (since,))
@@ -105,6 +168,8 @@ def hourly_summary() -> str:
         )
         rejects = cur.fetchall()
 
+        periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
+
     watch = [r for r in top if r["status"] == "WATCH"][:10]
     eligible = [r for r in top if r["status"] in {"ELIGIBLE", "ACTIONABLE"}][:10]
     actionable = [r for r in top if r["status"] == "ACTIONABLE"][:5]
@@ -145,7 +210,9 @@ def hourly_summary() -> str:
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
         f"Top Actionable: {actionable_txt}\n"
-        f"Top reject reasons: {reject_txt}"
+        f"Top reject reasons: {reject_txt}\n"
+        f"Periodic analysis: {periodic_analysis_txt}\n"
+        f"Recommended focus: {periodic_reco}"
     )
 
 
