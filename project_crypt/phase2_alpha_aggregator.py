@@ -30,6 +30,8 @@ DISCOVERY_TICK_SECONDS = int(os.getenv("PHASE2_DISCOVERY_TICK_SECONDS", "120"))
 MARKET_TICK_SECONDS = int(os.getenv("PHASE2_MARKET_TICK_SECONDS", "60"))
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", "/var/run/cryptobot/STOP")
 LISTING_STATE_PATH = os.getenv("PHASE2_LISTING_STATE_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_listing_state.json")
+DUNE_API_KEY = os.getenv("DUNE_API_KEY")
+DUNE_QUERY_IDS = [x.strip() for x in (os.getenv("DUNE_QUERY_IDS") or "").split(",") if x.strip()]
 
 
 class Source:
@@ -37,6 +39,8 @@ class Source:
     COINGECKO = "coingecko"
     CMC = "coinmarketcap"
     DEX = "dexscreener"
+    DEFILLAMA = "defillama"
+    DUNE = "dune"
     CRYPTOPANIC = "cryptopanic"
     FREE_NEWS = "free-crypto-news"
     X = "x"
@@ -459,6 +463,80 @@ def ingest_news() -> int:
     return total_hits
 
 
+def ingest_defillama() -> tuple[set[str], int]:
+    t0 = time.time()
+    symbols: set[str] = set()
+    points = 0
+    try:
+        chains = get_json("https://api.llama.fi/v2/chains")
+        protocols = get_json("https://api.llama.fi/protocols")
+
+        chain_rows = chains if isinstance(chains, list) else []
+        proto_rows = protocols if isinstance(protocols, list) else []
+
+        top_chains = sorted(chain_rows, key=lambda x: float(x.get("tvl") or 0), reverse=True)[:20]
+        for c in top_chains:
+            put_signal(None, Source.DEFILLAMA, "chain_tvl", {
+                "name": c.get("name"),
+                "tvl": c.get("tvl"),
+                "tokenSymbol": c.get("tokenSymbol"),
+                "change_1d": c.get("change_1d"),
+                "change_7d": c.get("change_7d"),
+            })
+
+        top_protocols = sorted(proto_rows, key=lambda x: float(x.get("tvl") or 0), reverse=True)[:300]
+        for p in top_protocols:
+            sym = str(p.get("symbol") or "").upper().strip()
+            if sym and sym.replace("$", "").replace("-", "").replace("_", "").isalnum():
+                symbols.add(sym)
+                put_signal(sym, Source.DEFILLAMA, "protocol_tvl", {
+                    "name": p.get("name"),
+                    "tvl": p.get("tvl"),
+                    "change_1d": p.get("change_1d"),
+                    "change_7d": p.get("change_7d"),
+                    "category": p.get("category"),
+                    "chains": p.get("chains"),
+                })
+
+        points = len(top_chains) + len(top_protocols)
+        log_source_health(Source.DEFILLAMA, "OK", int((time.time() - t0) * 1000), points)
+    except Exception as e:
+        put_signal(None, Source.DEFILLAMA, "ingest_error", {"error": str(e)})
+        log_source_health(Source.DEFILLAMA, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
+
+    return symbols, points
+
+
+def ingest_dune() -> tuple[set[str], int]:
+    t0 = time.time()
+    symbols: set[str] = set()
+    total_rows = 0
+
+    if not DUNE_API_KEY or not DUNE_QUERY_IDS:
+        log_source_health(Source.DUNE, "DISABLED", 0, 0, "missing api key/query ids")
+        return symbols, total_rows
+
+    headers = {"X-Dune-API-Key": DUNE_API_KEY}
+    for qid in DUNE_QUERY_IDS:
+        try:
+            u = f"https://api.dune.com/api/v1/query/{qid}/results"
+            d = get_json(u, headers=headers)
+            rows = d.get("result", {}).get("rows", []) if isinstance(d, dict) else []
+            total_rows += len(rows)
+            for r in rows[:300]:
+                sym = str(r.get("symbol") or r.get("token") or "").upper().strip()
+                if sym:
+                    symbols.add(sym)
+                    put_signal(sym, Source.DUNE, "query_signal", {"query_id": qid, "row": r})
+            put_signal(None, Source.DUNE, "query_summary", {"query_id": qid, "rows": len(rows)})
+        except Exception as e:
+            put_signal(None, Source.DUNE, "query_error", {"query_id": qid, "error": str(e)})
+
+    status = "OK" if total_rows > 0 else "DEGRADED"
+    log_source_health(Source.DUNE, status, int((time.time() - t0) * 1000), total_rows, None if total_rows > 0 else "no rows")
+    return symbols, total_rows
+
+
 def load_micro_latest() -> dict[str, dict]:
     out: dict[str, dict] = {}
     try:
@@ -489,13 +567,15 @@ def load_micro_latest() -> dict[str, dict]:
     return out
 
 
-def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int, venue_movers: set[str]) -> dict:
+def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int, venue_movers: set[str], llama_syms: set[str], dune_syms: set[str]) -> dict:
     x_on = bool(os.getenv("X_BEARER_TOKEN") or os.getenv("X_API_KEY"))
     reddit_on = bool(os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET"))
     return {
         Source.COINGECKO: len(cg) > 0,
         Source.CMC: len(cmc) > 0,
         Source.DEX: len(dex_latest) > 0,
+        Source.DEFILLAMA: len(llama_syms) > 0,
+        Source.DUNE: len(dune_syms) > 0,
         Source.CRYPTOPANIC: news_hits >= 0,
         Source.FREE_NEWS: news_hits >= 0,
         "venue_movers": len(venue_movers) > 0,
@@ -674,11 +754,17 @@ def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_news"})
     news_hits = ingest_news()
 
+    write_status({"state": "running", "job": "ingest_defillama"})
+    llama_syms, llama_points = ingest_defillama()
+
+    write_status({"state": "running", "job": "ingest_dune"})
+    dune_syms, dune_points = ingest_dune()
+
     write_status({"state": "running", "job": "load_micro_features"})
     micro_latest = load_micro_latest()
 
-    sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers)
-    discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings))
+    sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers, llama_syms, dune_syms)
+    discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings).union(llama_syms).union(dune_syms))
 
     mapped_count = 0
     eligible_count = 0
@@ -897,6 +983,10 @@ def run_cycle() -> dict:
         "sources_present": sources_present,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
+        "defillama_symbols_total": len(llama_syms),
+        "defillama_points": llama_points,
+        "dune_symbols_total": len(dune_syms),
+        "dune_points": dune_points,
         "adaptive_thresholds": {
             "min_volume_24h": round(dynamic_min_volume, 2),
             "max_spread_bps": round(dynamic_max_spread_bps, 2),

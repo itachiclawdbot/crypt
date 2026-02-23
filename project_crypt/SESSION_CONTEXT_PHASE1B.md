@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 11:33 SGT
+Last updated: 2026-02-23 11:39 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -148,6 +148,24 @@ In the next session, load these for full context:
   - batches token addresses into `/latest/dex/tokens/{addr1,addr2,...}`,
   - resolves canonical symbol from highest-liquidity pair `baseToken.symbol`.
 - Result: DEX symbols now ingest correctly (latest test window showed non-null symbol signals for profiles/boosts/top boosts).
+
+### 12) DeFiLlama + Dune on-chain intel integration (v1)
+- Added DeFiLlama ingestion into aggregator cycle:
+  - endpoints used: `/v2/chains`, `/protocols` (free/public)
+  - emits `chain_tvl` and `protocol_tvl` signals to `intel_cache`
+  - contributes symbols to discovery universe and source-availability map.
+- Added Dune ingestion hook:
+  - optional via `DUNE_API_KEY` + `DUNE_QUERY_IDS` env,
+  - fetches query results and emits `query_signal`/`query_summary` signals,
+  - degrades gracefully to `DISABLED` when keys/queries are missing.
+- Discovery union now includes on-chain symbols:
+  - `... + defillama_symbols + dune_symbols`.
+- Status summary now reports:
+  - `defillama_symbols_total`, `defillama_points`,
+  - `dune_symbols_total`, `dune_points`.
+- Current runtime validation:
+  - DeFiLlama active with non-zero symbols,
+  - Dune currently disabled/zero due to missing configured query outputs in env.
 
 ---
 
