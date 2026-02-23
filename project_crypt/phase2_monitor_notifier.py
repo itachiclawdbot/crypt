@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from project_crypt.telegram_notify import TelegramNotifier
 
@@ -272,14 +273,24 @@ def hourly_summary() -> str:
     )
 
 
+def seconds_until_next_hour_sgt() -> int:
+    sgt = ZoneInfo("Asia/Singapore")
+    now = datetime.now(sgt)
+    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(1, int((next_hour - now).total_seconds()))
+
+
 def main() -> None:
     tg = TelegramNotifier()
+    # Align notifications to fixed wall-clock hour boundaries in Singapore time
+    # (e.g., 16:00, 17:00, 18:00) regardless of process restarts.
     while True:
+        sleep_s = seconds_until_next_hour_sgt()
+        time.sleep(sleep_s)
         try:
             tg.send(hourly_summary())
         except Exception:
             pass
-        time.sleep(3600)
 
 
 if __name__ == "__main__":
