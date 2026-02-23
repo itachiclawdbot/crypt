@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 16:28 SGT
+Last updated: 2026-02-23 19:34 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -360,3 +360,21 @@ Runtime note:
 5) Tradable-only tuning lane separation
 - Hourly now surfaces `AutoTuner(tradable-only ghost 6h)` from `ghost_sim_runs` filtered to mapped instrument symbols.
 - External non-tradable discovery remains visible but isolated from tradable tuning interpretation.
+
+---
+
+## 2026-02-23 two-issue pass (micro capacity + identity hygiene in liquidity display)
+1) Micro capacity-limit fix
+- microservice target tracking increased and made explicitly capacity-aware:
+  - `MICRO_TOP_SYMBOLS` default raised to 150,
+  - target size now `min(eligible_unique, K)` with continuity floor,
+  - stable-asset bases removed from tracked candidates.
+- Added persistent state fields in `micro_universe_state.json`:
+  - `micro_target_k`, `eligible_unique`.
+- Result: micro coverage improved significantly in current cycles (micro_present and join_rate materially higher).
+
+2) Micro liquidity display hygiene
+- hourly “best liquidity” query now filters to:
+  - tradable active universe intersection (`universe_state` recent mapped bases),
+  - excludes stable/quote-like bases (`USDT/USDC/USD/EUR/PYUSD/...`) from display lane.
+- Prevents PYUSD-like entries from contaminating top-liquidity UX output.

@@ -1360,7 +1360,9 @@ def run_cycle() -> dict:
     llama_join = len([s for s in eligible_syms if s in llama_syms])
     dex_join = len([s for s in eligible_syms if s in dex_latest or s in dex_boosted])
     denom = max(1, len(eligible_syms))
+    micro_target_k = int(os.getenv("MICRO_TOP_SYMBOLS", "150"))
     sanity = {
+        "micro_target_k": micro_target_k,
         "eligible_unique": len({x["instrument_symbol"] for x in eligible_rows}),
         "actionable_unique": len({x["instrument_symbol"] for x in actionable_rows}),
         "duplicates_removed": duplicates_removed,

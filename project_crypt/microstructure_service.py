@@ -17,6 +17,7 @@ TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
 MICRO_STATE_PATH = os.getenv("MICRO_STATE_PATH", "/home/itachi/.openclaw/workspace/project_crypt/micro_universe_state.json")
 MICRO_MAX_REPLACEMENTS = int(os.getenv("MICRO_MAX_REPLACEMENTS", "20"))
 MICRO_MIN_RESIDENCY_SEC = int(os.getenv("MICRO_MIN_RESIDENCY_SEC", "1800"))
+STABLE_BASES = {"USDT", "USDC", "USD", "EUR", "PYUSD", "TUSD", "USDP", "BUSD", "DAI", "FDUSD", "USDE"}
 
 
 def utc_now() -> str:
@@ -95,6 +96,7 @@ def _active_universe_symbols(limit: int) -> list[str]:
               and status in ('WATCH','ELIGIBLE','ACTIONABLE')
               and instrument_symbol is not null
               and quote_ccy in ('USDT','USD','USDC','EUR')
+              and coalesce(base_ccy,'') not in ('USDT','USDC','USD','EUR','PYUSD','TUSD','USDP','BUSD','DAI','FDUSD','USDE')
             group by instrument_symbol
             order by max(alpha_score) desc
             limit ?
@@ -133,7 +135,7 @@ def top_symbols() -> list[str]:
         base, quote = inst.split("_", 1)
         if quote not in {"USD", "USDT", "USDC", "EUR"}:
             continue
-        if base in {"USDT", "USDC", "USD", "EUR"}:
+        if base in STABLE_BASES:
             continue
         vol_quote = float(r.get("vv") or 0.0)
         if vol_quote <= 0:
@@ -141,9 +143,9 @@ def top_symbols() -> list[str]:
         pairs.append((inst, vol_quote))
     pairs.sort(key=lambda x: x[1], reverse=True)
 
-    # Issue-1 fix: expand to 120 interest-based books by default.
+    # Issue-1 refinement: capacity-aware target based on current active universe.
     top_vol = [p[0] for p in pairs[: max(40, TOP_SYMBOLS // 2)]]
-    active = _active_universe_symbols(max(60, TOP_SYMBOLS))
+    active = _active_universe_symbols(500)
     pinned = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT", "SUI_USDT"]
 
     candidates = []
@@ -166,7 +168,10 @@ def top_symbols() -> list[str]:
         if inst in candidates or age < MICRO_MIN_RESIDENCY_SEC:
             keep.append(inst)
 
-    desired = candidates[:TOP_SYMBOLS]
+    # Target size: min(eligible_universe, K) with floor for continuity.
+    eligible_unique = len(active)
+    target_k = max(40, min(TOP_SYMBOLS, eligible_unique if eligible_unique > 0 else TOP_SYMBOLS))
+    desired = candidates[:target_k]
     additions = [s for s in desired if s not in keep]
     additions = additions[: max(1, MICRO_MAX_REPLACEMENTS)]
 
@@ -174,12 +179,12 @@ def top_symbols() -> list[str]:
     for s in keep + additions:
         if s not in final:
             final.append(s)
-        if len(final) >= TOP_SYMBOLS:
+        if len(final) >= target_k:
             break
 
     # backfill if needed
     for s in desired:
-        if len(final) >= TOP_SYMBOLS:
+        if len(final) >= target_k:
             break
         if s not in final:
             final.append(s)
@@ -188,6 +193,8 @@ def top_symbols() -> list[str]:
     for s in final:
         new_tracked[s] = tracked.get(s) or utc_now()
     state["tracked"] = new_tracked
+    state["micro_target_k"] = target_k
+    state["eligible_unique"] = eligible_unique
     state["updated_ts"] = utc_now()
     _save_micro_state(state)
 

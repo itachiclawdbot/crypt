@@ -220,11 +220,20 @@ def hourly_summary() -> str:
 
         cur.execute(
             """
-            select base_symbol, liquidity_score
-            from micro_features_latest
-            order by liquidity_score desc
+            select m.base_symbol, m.liquidity_score
+            from micro_features_latest m
+            where m.base_symbol not in ('USDT','USDC','USD','EUR','PYUSD','TUSD','USDP','BUSD','DAI','FDUSD','USDE')
+              and exists (
+                select 1
+                from universe_state u
+                where u.ts >= ?
+                  and u.instrument_symbol is not null
+                  and coalesce(u.base_ccy,u.symbol)=m.base_symbol
+              )
+            order by m.liquidity_score desc
             limit 6
-            """
+            """,
+            (since,),
         )
         best_liq = cur.fetchall()
 
@@ -317,7 +326,9 @@ def hourly_summary() -> str:
         except Exception:
             sj = {}
         micro_cov_line = (
+            f"micro_target_K={sj.get('micro_target_k', 0)} "
             f"micro_tracked_count={sj.get('micro_present', 0)} "
+            f"eligible_unique={sj.get('eligible_unique', 0)} "
             f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
             f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
         )
