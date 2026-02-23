@@ -505,13 +505,14 @@ def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_
     }
 
 
-def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str], dex_boosted: set[str], venue_movers: set[str], mapped: bool, sources_present: dict, venue_metrics: dict[str, dict]) -> tuple[float, float, dict]:
+def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str], dex_boosted: set[str], venue_movers: set[str], sources_present: dict, venue_metrics: dict[str, dict]) -> tuple[float, float, dict]:
     base_weights = {
-        "market": 30.0,
-        "liquidity": 25.0,
+        "market": 28.0,
+        "liquidity": 22.0,
         "microstructure": 25.0,
         "news": 10.0,
         "social": 10.0,
+        "attention": 5.0,
     }
     social_available = sources_present.get(Source.X) or sources_present.get(Source.REDDIT)
     if not social_available:
@@ -555,9 +556,16 @@ def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str
         social_points += 12.0 if symbol in dex_boosted else 0.0
         score += min(base_weights["social"], social_points)
 
+    # Attention burst score from DEX profile/boost activity (capped by attention weight).
+    attention_burst = 0.0
+    if symbol in dex_latest:
+        attention_burst += 2.0
+    if symbol in dex_boosted:
+        attention_burst += 5.0
+    attention_score = min(base_weights["attention"], attention_burst)
+    score += attention_score
+
     confidence = max(0.05, min(0.99, score / 100.0))
-    if not mapped:
-        confidence *= 0.7
 
     return score, confidence, {
         "weights": base_weights,
@@ -566,6 +574,7 @@ def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str
         "micro_points": micro_points,
         "news_points": news_points,
         "social_points": social_points,
+        "attention_score": attention_score,
         "spread_bps": spread_bps,
     }
 
@@ -715,8 +724,10 @@ def run_cycle() -> dict:
         elif liquidity_cover >= 5:
             eligibility_score += 10
 
+        risk_flags: list[str] = list(micro.get("risk_flags", []))
+
         alpha_score, confidence, alpha_dbg = weighted_alpha(
-            sym, cg, cmc, dex_latest, dex_boosted, venue_movers, mapped, sources_present, venue_metrics
+            sym, cg, cmc, dex_latest, dex_boosted, venue_movers, sources_present, venue_metrics
         )
         if micro.get("pressure_flag"):
             alpha_score += 8.0
@@ -727,7 +738,6 @@ def run_cycle() -> dict:
 
         status = "WATCH"
         stage_reached = "discovery"
-        risk_flags: list[str] = list(micro.get("risk_flags", []))
         is_new_listing = sym in new_listings
         if is_new_listing:
             risk_flags.append("new_listing")
