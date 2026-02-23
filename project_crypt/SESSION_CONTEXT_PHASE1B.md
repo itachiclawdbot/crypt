@@ -100,7 +100,17 @@ X/Reddit direct ingestion:
   - checks `KILL_SWITCH_FILE` (default `/var/run/cryptobot/STOP`), enters halted hold loop if present,
   - emits critical Telegram alert once while active,
   - status JSON includes `kill_switch_active` for dashboard visibility.
-- `phase2_monitor_notifier.py`: hourly Telegram digest now includes funnel metrics + top watch/eligible/actionable + reject reasons.
+- `phase2_monitor_notifier.py`: hourly Telegram digest includes both legacy and new observability fields:
+  - fetched signals,
+  - by source,
+  - trend signals,
+  - trending symbols,
+  - potential buys,
+  - source health,
+  - funnel metrics,
+  - sources-present map,
+  - top watch/eligible/actionable,
+  - top reject reasons.
 - `phase2_ops_dashboard.py`: displays funnel stages, top reject reasons, top watch/eligible/actionable, and kill-switch flag.
 
 ---
