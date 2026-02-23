@@ -184,12 +184,28 @@ def ingest_cryptocom() -> set[str]:
     symbols: set[str] = set()
     try:
         instruments = get_json("https://api.crypto.com/exchange/v1/public/get-instruments")
-        rows = instruments.get("result", {}).get("instruments", []) if isinstance(instruments, dict) else []
-        for r in rows[:2000]:
-            name = str(r.get("instrument_name", ""))
-            if name.endswith("_USDT"):
+        result = instruments.get("result", {}) if isinstance(instruments, dict) else {}
+
+        # Crypto.com schema drift handling:
+        # - old: result.instruments[] with instrument_name like BTC_USDT
+        # - new: result.data[] with symbol/base_ccy/quote_ccy and symbol like BTC_USD
+        rows = result.get("instruments") or result.get("data") or []
+
+        for r in rows[:5000]:
+            quote = str(r.get("quote_ccy") or r.get("quote_currency") or "").upper()
+            base = str(r.get("base_ccy") or r.get("base_currency") or "").upper()
+            name = str(r.get("instrument_name") or r.get("symbol") or "").upper()
+
+            # Keep USD + USDT spot mappings for broader venue tradability mapping.
+            if base and quote in {"USD", "USDT"}:
+                symbols.add(base)
+                continue
+
+            # Fallback parse for pair strings if fields are missing.
+            if name.endswith("_USDT") or name.endswith("_USD"):
                 symbols.add(name.split("_")[0].upper())
-        put_signal(None, Source.CRYPTOCOM, "instruments_snapshot", {"count": len(rows)})
+
+        put_signal(None, Source.CRYPTOCOM, "instruments_snapshot", {"count": len(rows), "mapped_bases": len(symbols)})
         log_source_health(Source.CRYPTOCOM, "OK", int((time.time() - t0) * 1000), len(rows))
     except Exception as e:
         put_signal(None, Source.CRYPTOCOM, "ingest_error", {"error": str(e)})
