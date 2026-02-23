@@ -7,7 +7,7 @@ import random
 import sqlite3
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -77,6 +77,14 @@ def _norm_url(endpoint: str) -> str:
     return DEX_SCREENER_BASE_URL.rstrip("/") + "/" + e
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {r[1] for r in cur.fetchall()}
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
 def init_tables() -> None:
     with db() as c:
         c.execute(
@@ -142,6 +150,9 @@ def init_tables() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
                 symbol TEXT NOT NULL,
+                instrument_symbol TEXT,
+                base_ccy TEXT,
+                quote_ccy TEXT,
                 eligibility_score REAL,
                 alpha_score REAL,
                 confidence REAL,
@@ -153,6 +164,63 @@ def init_tables() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS listing_watch (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_first TEXT NOT NULL,
+                ts_last TEXT NOT NULL,
+                symbol_guess TEXT,
+                chain TEXT,
+                address TEXT,
+                priority_score REAL,
+                reasons_json TEXT,
+                status TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS listing_watch_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ghost_sim_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                instrument_symbol TEXT NOT NULL,
+                entry_ts TEXT,
+                exit_ts TEXT,
+                horizon TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                pnl_bps REAL,
+                costs_bps REAL,
+                net_pnl_bps REAL,
+                reject_reason TEXT,
+                features_ref TEXT
+            )
+            """
+        )
+        _ensure_column(c, "candidate_funnel_log", "watch_total", "INTEGER")
+        _ensure_column(c, "candidate_funnel_log", "actionable_total", "INTEGER")
+        _ensure_column(c, "candidate_funnel_log", "alpha_scored_total", "INTEGER")
+        _ensure_column(c, "candidate_funnel_log", "cost_evaluated_total", "INTEGER")
+        _ensure_column(c, "candidate_funnel_log", "risk_evaluated_total", "INTEGER")
+        _ensure_column(c, "candidate_funnel_log", "rejects_tradable_json", "TEXT")
+        _ensure_column(c, "candidate_funnel_log", "rejects_external_json", "TEXT")
+        _ensure_column(c, "candidate_funnel_log", "sanity_json", "TEXT")
+        _ensure_column(c, "candidate_funnel_log", "regime", "TEXT")
+        _ensure_column(c, "candidate_funnel_log", "pressure_count", "INTEGER")
+        _ensure_column(c, "universe_state", "instrument_symbol", "TEXT")
+        _ensure_column(c, "universe_state", "base_ccy", "TEXT")
+        _ensure_column(c, "universe_state", "quote_ccy", "TEXT")
 
 
 def put_signal(symbol: str | None, source: str, signal_type: str, payload: dict, conviction: str = "watch") -> None:
@@ -185,38 +253,47 @@ def get_text(url: str, headers: dict | None = None) -> str:
     return r.text
 
 
-def ingest_cryptocom() -> set[str]:
+def ingest_cryptocom() -> tuple[set[str], dict[str, str]]:
     t0 = time.time()
-    symbols: set[str] = set()
+    invalid_bases = {"USDT", "USDC", "USD", "EUR"}
+    bases: set[str] = set()
+    base_to_instrument: dict[str, str] = {}
     try:
         instruments = get_json("https://api.crypto.com/exchange/v1/public/get-instruments")
         result = instruments.get("result", {}) if isinstance(instruments, dict) else {}
-
-        # Crypto.com schema drift handling:
-        # - old: result.instruments[] with instrument_name like BTC_USDT
-        # - new: result.data[] with symbol/base_ccy/quote_ccy and symbol like BTC_USD
         rows = result.get("instruments") or result.get("data") or []
 
         for r in rows[:5000]:
             quote = str(r.get("quote_ccy") or r.get("quote_currency") or "").upper()
             base = str(r.get("base_ccy") or r.get("base_currency") or "").upper()
             name = str(r.get("instrument_name") or r.get("symbol") or "").upper()
+            inst_type = str(r.get("inst_type") or "")
 
-            # Keep USD + USDT spot mappings for broader venue tradability mapping.
-            if base and quote in {"USD", "USDT"}:
-                symbols.add(base)
+            if not base and (name.endswith("_USDT") or name.endswith("_USD") or name.endswith("_USDC") or name.endswith("_EUR")):
+                parts = name.split("_")
+                if len(parts) >= 2:
+                    base, quote = parts[0], parts[1]
+
+            if not base or base in invalid_bases:
+                continue
+            if quote not in {"USD", "USDT", "USDC", "EUR"}:
+                continue
+            if inst_type and inst_type != "CCY_PAIR":
                 continue
 
-            # Fallback parse for pair strings if fields are missing.
-            if name.endswith("_USDT") or name.endswith("_USD"):
-                symbols.add(name.split("_")[0].upper())
+            instrument_symbol = name if "_" in name else f"{base}_{quote}"
+            # prefer USDT over USD over USDC over EUR for canonical join key
+            prev = base_to_instrument.get(base)
+            if prev is None or prev.endswith("_EUR") or (prev.endswith("_USD") and instrument_symbol.endswith("_USDT")) or (prev.endswith("_USDC") and instrument_symbol.endswith("_USDT")):
+                base_to_instrument[base] = instrument_symbol
+            bases.add(base)
 
-        put_signal(None, Source.CRYPTOCOM, "instruments_snapshot", {"count": len(rows), "mapped_bases": len(symbols)})
+        put_signal(None, Source.CRYPTOCOM, "instruments_snapshot", {"count": len(rows), "mapped_bases": len(bases), "mapped_instruments": len(base_to_instrument)})
         log_source_health(Source.CRYPTOCOM, "OK", int((time.time() - t0) * 1000), len(rows))
     except Exception as e:
         put_signal(None, Source.CRYPTOCOM, "ingest_error", {"error": str(e)})
         log_source_health(Source.CRYPTOCOM, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
-    return symbols
+    return bases, base_to_instrument
 
 
 def _percentile(values: list[float], p: float, fallback: float) -> float:
@@ -667,16 +744,19 @@ def log_reject(symbol: str, stage: str, reason: str, metrics: dict) -> None:
         )
 
 
-def log_universe_state(symbol: str, eligibility_score: float, alpha_score: float, confidence: float, status: str, deny_stage: str | None, deny_reason: str | None, metrics: dict, sources_present: dict) -> None:
+def log_universe_state(symbol: str, instrument_symbol: str | None, base_ccy: str | None, quote_ccy: str | None, eligibility_score: float, alpha_score: float, confidence: float, status: str, deny_stage: str | None, deny_reason: str | None, metrics: dict, sources_present: dict) -> None:
     with db() as c:
         c.execute(
             """
-            INSERT INTO universe_state (ts,symbol,eligibility_score,alpha_score,confidence,status,deny_stage,deny_reason,metrics_json,sources_present_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO universe_state (ts,symbol,instrument_symbol,base_ccy,quote_ccy,eligibility_score,alpha_score,confidence,status,deny_stage,deny_reason,metrics_json,sources_present_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 utc_now(),
                 symbol,
+                instrument_symbol,
+                base_ccy,
+                quote_ccy,
                 eligibility_score,
                 alpha_score,
                 confidence,
@@ -689,12 +769,17 @@ def log_universe_state(symbol: str, eligibility_score: float, alpha_score: float
         )
 
 
-def log_funnel(discovered: int, mapped: int, eligible: int, alpha_pass: int, risk_pass: int, cost_pass: int, proposed: int, top_reasons: list[tuple[str, int]], sources_present: dict) -> None:
+def log_funnel(discovered: int, mapped: int, eligible: int, alpha_pass: int, risk_pass: int, cost_pass: int, proposed: int, top_reasons: list[tuple[str, int]], sources_present: dict, extras: dict | None = None) -> None:
+    e = extras or {}
     with db() as c:
         c.execute(
             """
-            INSERT INTO candidate_funnel_log (ts,discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,reasons_json,sources_present_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO candidate_funnel_log (
+                ts,discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,
+                reasons_json,sources_present_json,watch_total,actionable_total,alpha_scored_total,cost_evaluated_total,risk_evaluated_total,
+                rejects_tradable_json,rejects_external_json,sanity_json,regime,pressure_count
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 utc_now(),
@@ -707,8 +792,34 @@ def log_funnel(discovered: int, mapped: int, eligible: int, alpha_pass: int, ris
                 proposed,
                 json.dumps(top_reasons, default=str),
                 json.dumps(sources_present, default=str),
+                int(e.get("watch_total", 0)),
+                int(e.get("actionable_total", proposed)),
+                int(e.get("alpha_scored_total", 0)),
+                int(e.get("cost_evaluated_total", 0)),
+                int(e.get("risk_evaluated_total", 0)),
+                json.dumps(e.get("rejects_tradable", {}), default=str),
+                json.dumps(e.get("rejects_external", {}), default=str),
+                json.dumps(e.get("sanity", {}), default=str),
+                e.get("regime"),
+                int(e.get("pressure_count", 0)),
             ),
         )
+
+
+def classify_regime(venue_metrics: dict[str, dict], micro_latest: dict[str, dict]) -> str:
+    spreads = [float(v.get("spread_bps_p95_300", 0.0)) for v in micro_latest.values() if v.get("spread_bps_p95_300") is not None]
+    vols = [abs(float(v.get("chg_24h_abs", 0.0))) for v in venue_metrics.values()]
+    med_spread = _percentile(spreads, 0.5, 20.0)
+    med_vol = _percentile(vols, 0.5, 0.02)
+    if med_spread <= 15 and med_vol <= 0.02:
+        return "QUIET"
+    if med_spread >= 35 or med_vol >= 0.06:
+        return "VOLATILE"
+    return "NORMAL"
+
+
+def obi_threshold_for_regime(regime: str) -> float:
+    return {"QUIET": 0.40, "NORMAL": 0.55, "VOLATILE": 0.70}.get(regime, 0.55)
 
 
 def build_startup_ping(summary: dict) -> str:
@@ -734,13 +845,104 @@ def build_startup_ping(summary: dict) -> str:
     )
 
 
+def refresh_listing_watch(dex_boosted: set[str], dex_latest: set[str], llama_syms: set[str], crypto_bases: set[str]) -> None:
+    now = utc_now()
+    candidates = sorted((dex_boosted.union(dex_latest)).difference(crypto_bases))
+    with db() as c:
+        for sym in candidates[:500]:
+            fundamentals = sym in llama_syms
+            priority = 60.0 + (25.0 if sym in dex_boosted else 0.0) + (15.0 if fundamentals else 0.0)
+            reasons = {"dex_boosted": sym in dex_boosted, "dex_latest": sym in dex_latest, "fundamentals_spike": fundamentals}
+            c.execute(
+                """
+                INSERT INTO listing_watch (ts_first,ts_last,symbol_guess,chain,address,priority_score,reasons_json,status)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (now, now, sym, None, None, priority, json.dumps(reasons), "watching"),
+            )
+        c.execute(
+            """
+            UPDATE listing_watch
+            SET ts_last=?, status='watching'
+            WHERE symbol_guess IN ({})
+            """.format(",".join("?" * len(candidates)) if candidates else "''"),
+            ([now] + candidates) if candidates else [now],
+        )
+
+
+def emit_listing_front_run(new_listings: set[str]) -> set[str]:
+    triggered: set[str] = set()
+    if not new_listings:
+        return triggered
+    with db() as c:
+        cur = c.cursor()
+        for sym in sorted(new_listings):
+            cur.execute("select id,priority_score,reasons_json from listing_watch where symbol_guess=? and status='watching' order by id desc limit 1", (sym,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            triggered.add(sym)
+            details = {
+                "symbol": sym,
+                "priority_score": float(row[1] or 0.0),
+                "reasons": json.loads(row[2] or "{}"),
+            }
+            put_signal(sym, Source.SYSTEM, "listing_front_run", details, conviction="moonshot")
+            c.execute("insert into listing_watch_events (ts,event_type,details_json) values (?,?,?)", (utc_now(), "listing_front_run", json.dumps(details)))
+            c.execute("update listing_watch set status='triggered', ts_last=? where id=?", (utc_now(), int(row[0])))
+    return triggered
+
+
+def run_ghost_simulator() -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    rows_done = 0
+    with db() as c:
+        cur = c.cursor()
+        cur.execute(
+            """
+            select instrument_symbol, ts, deny_reason, alpha_score, metrics_json
+            from universe_state
+            where ts>=? and status in ('WATCH','ELIGIBLE') and deny_reason in ('alpha-score-below-threshold','net-edge-too-low') and instrument_symbol is not null
+            order by id desc
+            limit 120
+            """,
+            (since,),
+        )
+        candidates = cur.fetchall()
+        for r in candidates:
+            inst = r[0]
+            try:
+                d = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
+                candles = d.get("result", {}).get("data", []) if isinstance(d, dict) else []
+                if len(candles) < 4:
+                    continue
+                entry = float(candles[-2].get("o") or 0.0)
+                exitp = float(candles[-1].get("c") or 0.0)
+                if entry <= 0 or exitp <= 0:
+                    continue
+                pnl_bps = ((exitp - entry) / entry) * 10000.0
+                costs_bps = 18.0
+                net = pnl_bps - costs_bps
+                cur.execute(
+                    """
+                    insert into ghost_sim_runs (ts,instrument_symbol,entry_ts,exit_ts,horizon,entry_price,exit_price,pnl_bps,costs_bps,net_pnl_bps,reject_reason,features_ref)
+                    values (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (utc_now(), inst, r[1], utc_now(), "5m", entry, exitp, pnl_bps, costs_bps, net, r[2], None),
+                )
+                rows_done += 1
+            except Exception:
+                continue
+    return {"rows": rows_done}
+
+
 def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_cryptocom"})
-    crypto_symbols = ingest_cryptocom()
+    crypto_bases, base_to_instrument = ingest_cryptocom()
 
     write_status({"state": "running", "job": "ingest_cryptocom_movers"})
     venue_movers, venue_metrics = ingest_cryptocom_movers()
-    new_listings = detect_new_listings(crypto_symbols)
+    new_listings = detect_new_listings(crypto_bases)
 
     write_status({"state": "running", "job": "ingest_coingecko"})
     cg = ingest_coingecko()
@@ -766,6 +968,9 @@ def run_cycle() -> dict:
     sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers, llama_syms, dune_syms)
     discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings).union(llama_syms).union(dune_syms))
 
+    refresh_listing_watch(dex_boosted, dex_latest, llama_syms, crypto_bases)
+    front_run_symbols = emit_listing_front_run(new_listings)
+
     mapped_count = 0
     eligible_count = 0
     alpha_pass_count = 0
@@ -773,10 +978,22 @@ def run_cycle() -> dict:
     cost_pass_count = 0
     proposed_count = 0
     reject_counter: Counter = Counter()
+    rejects_tradable: Counter = Counter()
+    rejects_external: Counter = Counter()
 
     watchlist: list[dict] = []
     eligible_list: list[dict] = []
     actionable_list: list[dict] = []
+
+    regime = classify_regime(venue_metrics, micro_latest)
+    obi_threshold = obi_threshold_for_regime(regime)
+    pressure_count = 0
+
+    alpha_scored_count = 0
+    cost_evaluated_count = 0
+    risk_evaluated_count = 0
+    invalid_assets_filtered = 0
+    alpha_floor_override_count = 0
 
     venue_vols = [float(v.get("volume_24h_quote", 0.0)) for v in venue_metrics.values()]
     venue_spreads = [float(v.get("spread_bps", 9999.0)) for v in venue_metrics.values()]
@@ -784,7 +1001,14 @@ def run_cycle() -> dict:
     dynamic_max_spread_bps = min(50.0, _percentile(venue_spreads, 0.75, 50.0))
 
     for sym in discovered:
-        mapped = sym in crypto_symbols
+        sym_norm = str(sym).upper().strip()
+        if sym_norm in {"USDT", "USDC", "USD", "EUR"} or not sym_norm.replace("$", "").replace("-", "").replace("_", "").isalnum():
+            invalid_assets_filtered += 1
+            continue
+        sym = sym_norm
+
+        mapped = sym in crypto_bases
+        instrument_symbol = base_to_instrument.get(sym)
         if mapped:
             mapped_count += 1
 
@@ -815,9 +1039,14 @@ def run_cycle() -> dict:
         alpha_score, confidence, alpha_dbg = weighted_alpha(
             sym, cg, cmc, dex_latest, dex_boosted, venue_movers, sources_present, venue_metrics
         )
-        if micro.get("pressure_flag"):
+        alpha_scored_count += 1
+        obi20 = abs(float(micro.get("obi_20bps", 0.0)))
+        pressure_flag = obi20 >= obi_threshold
+        if pressure_flag:
+            pressure_count += 1
             alpha_score += 8.0
-        if abs(float(micro.get("obi_20bps", 0.0))) >= 0.70:
+            risk_flags.append("pressure_flag")
+        if regime == "VOLATILE" and obi20 >= 0.85:
             alpha_score += 3.0
             risk_flags.append("obi_extreme")
         alpha_score = min(100.0, alpha_score)
@@ -839,21 +1068,35 @@ def run_cycle() -> dict:
             float(venue.get("chg_24h_abs", 0.0)),
             depth_usd_20bps=depth_20bps,
         )
+        cost_evaluated_count += 1
         safety_margin_bps = 12.0 if not is_new_listing else 20.0
         cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
 
-        if not mapped:
+        if sym in front_run_symbols and mapped:
+            status = "ACTIONABLE"
+            stage_reached = "actionable"
+            alpha_score = 100.0
+            confidence = max(confidence, 0.9)
+            risk_flags.extend(["listing_front_run", "dex_hype", "fundamentals_spike"])
+            proposed_count += 1
+            risk_pass_count += 1
+            cost_pass_count += 1
+            alpha_pass_count += 1
+            put_signal(sym, Source.SYSTEM, "listing_front_run_actionable", {"instrument_symbol": instrument_symbol, "alpha_score": alpha_score}, conviction="moonshot")
+        elif not mapped:
             deny_stage = "mapping"
             stage_reached = "mapping"
-            deny_reason = "not-tradable-on-crypto-com"
+            deny_reason = "not-tradable-external"
             reject_counter[deny_reason] += 1
-            log_reject(sym, deny_stage, deny_reason, {"mapped": mapped})
+            rejects_external["not_tradable"] += 1
+            log_reject(sym, deny_stage, deny_reason, {"mapped": mapped, "instrument_symbol": instrument_symbol})
             status = "WATCH"
         elif eligibility_score < MIN_ELIGIBLE_SCORE:
             deny_stage = "eligibility"
             stage_reached = "eligibility"
             deny_reason = "eligibility-score-too-low"
             reject_counter[deny_reason] += 1
+            rejects_tradable["eligibility"] += 1
             log_reject(sym, deny_stage, deny_reason, {
                 "eligibility_score": eligibility_score,
                 "volume_24h": volume_24h,
@@ -867,12 +1110,17 @@ def run_cycle() -> dict:
             eligible_count += 1
             stage_reached = "eligibility"
             status = "ELIGIBLE"
-            if alpha_score < MIN_ACTIONABLE_SCORE:
+            alpha_floor_effective = MIN_ACTIONABLE_SCORE
+            if (not sources_present.get(Source.X) and not sources_present.get(Source.REDDIT) and sym in venue_movers and obi20 >= 0.5 and liquidity_cover >= 20):
+                alpha_floor_effective = 50.0
+                alpha_floor_override_count += 1
+            if alpha_score < alpha_floor_effective:
                 deny_stage = "alpha"
                 stage_reached = "alpha"
                 deny_reason = "alpha-score-below-threshold"
                 reject_counter[deny_reason] += 1
-                log_reject(sym, deny_stage, deny_reason, {"alpha_score": alpha_score, "confidence": confidence})
+                rejects_tradable["alpha"] += 1
+                log_reject(sym, deny_stage, deny_reason, {"alpha_score": alpha_score, "confidence": confidence, "alpha_floor_effective": alpha_floor_effective})
             else:
                 alpha_pass_count += 1
                 stage_reached = "alpha"
@@ -881,6 +1129,7 @@ def run_cycle() -> dict:
                     stage_reached = "cost"
                     deny_reason = "net-edge-too-low"
                     reject_counter[deny_reason] += 1
+                    rejects_tradable["cost"] += 1
                     log_reject(sym, deny_stage, deny_reason, {
                         "expected_edge_bps": expected_edge_bps,
                         "est_cost_bps": est_cost_bps,
@@ -891,12 +1140,14 @@ def run_cycle() -> dict:
                     cost_pass_count += 1
                     stage_reached = "cost"
                     min_conf = 0.55 if not is_new_listing else 0.65
+                    risk_evaluated_count += 1
                     risk_block = confidence < min_conf
                     if risk_block:
                         deny_stage = "risk"
                         stage_reached = "risk"
                         deny_reason = "confidence-too-low"
                         reject_counter[deny_reason] += 1
+                        rejects_tradable["risk"] += 1
                         log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf})
                     else:
                         risk_pass_count += 1
@@ -912,8 +1163,15 @@ def run_cycle() -> dict:
                             "new_listing": is_new_listing,
                         }, conviction="high")
 
+        if sym in {"USDT", "USDC", "USD", "EUR"}:
+            invalid_assets_filtered += 1
+            continue
+
         item = {
             "symbol": sym,
+            "instrument_symbol": instrument_symbol or f"{sym}_UNMAPPED",
+            "base_ccy": sym,
+            "quote_ccy": (instrument_symbol.split("_")[1] if instrument_symbol and "_" in instrument_symbol else None),
             "status": status,
             "stage_reached": stage_reached,
             "eligibility_score": round(eligibility_score, 2),
@@ -932,7 +1190,7 @@ def run_cycle() -> dict:
         if status == "ACTIONABLE":
             actionable_list.append(item)
 
-        log_universe_state(sym, eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {
+        log_universe_state(sym, instrument_symbol, sym, (instrument_symbol.split("_")[1] if instrument_symbol and "_" in instrument_symbol else None), eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {
             "stage_reached": stage_reached,
             "volume_24h": volume_24h,
             "spread_bps": spread_bps,
@@ -952,35 +1210,96 @@ def run_cycle() -> dict:
         }, sources_present)
 
     top_reasons = reject_counter.most_common(8)
+
+    # dedupe by instrument_symbol
+    deduped: dict[str, dict] = {}
+    duplicates_removed = 0
+    for row in sorted(watchlist, key=lambda x: (x.get("instrument_symbol") or "", x.get("alpha_score", 0.0)), reverse=True):
+        k = row.get("instrument_symbol") or ""
+        if not k:
+            continue
+        if k in deduped:
+            duplicates_removed += 1
+            continue
+        deduped[k] = row
+    all_rows = list(deduped.values())
+
+    watch_rows = [x for x in all_rows if x["status"] == "WATCH"]
+    eligible_rows = [x for x in all_rows if x["status"] == "ELIGIBLE"]
+    actionable_rows = [x for x in all_rows if x["status"] == "ACTIONABLE"]
+
+    # watchlist must come from ELIGIBLE universe first
+    watch_top = sorted(eligible_rows, key=lambda x: x["alpha_score"], reverse=True)[:10]
+    if not watch_top and len(eligible_rows) > 0:
+        watch_top = eligible_rows[:10]
+    eligible_top = sorted(eligible_rows + actionable_rows, key=lambda x: x["alpha_score"], reverse=True)[:10]
+    actionable_top = sorted(actionable_rows, key=lambda x: x["alpha_score"], reverse=True)[:5]
+
+    eligible_syms = {x["symbol"] for x in eligible_rows + actionable_rows}
+    micro_join = len([s for s in eligible_syms if s in micro_latest])
+    llama_join = len([s for s in eligible_syms if s in llama_syms])
+    dex_join = len([s for s in eligible_syms if s in dex_latest or s in dex_boosted])
+    denom = max(1, len(eligible_syms))
+    sanity = {
+        "eligible_unique": len({x["instrument_symbol"] for x in eligible_rows}),
+        "actionable_unique": len({x["instrument_symbol"] for x in actionable_rows}),
+        "duplicates_removed": duplicates_removed,
+        "invalid_assets_filtered": invalid_assets_filtered,
+        "micro_present": len(micro_latest),
+        "join_rate_to_eligible": {
+            "micro": round(micro_join / denom, 3),
+            "defillama": round(llama_join / denom, 3),
+            "dex": round(dex_join / denom, 3),
+        },
+    }
+
     log_funnel(
         discovered=len(discovered),
         mapped=mapped_count,
-        eligible=eligible_count,
+        eligible=len(eligible_rows) + len(actionable_rows),
         alpha_pass=alpha_pass_count,
         risk_pass=risk_pass_count,
         cost_pass=cost_pass_count,
-        proposed=proposed_count,
+        proposed=len(actionable_rows),
         top_reasons=top_reasons,
         sources_present=sources_present,
+        extras={
+            "watch_total": len(watch_rows),
+            "actionable_total": len(actionable_rows),
+            "alpha_scored_total": alpha_scored_count,
+            "cost_evaluated_total": cost_evaluated_count,
+            "risk_evaluated_total": risk_evaluated_count,
+            "rejects_tradable": dict(rejects_tradable),
+            "rejects_external": dict(rejects_external),
+            "sanity": sanity,
+            "regime": regime,
+            "pressure_count": pressure_count,
+        },
     )
-
-    watch_top = sorted(watchlist, key=lambda x: x["alpha_score"], reverse=True)[:10]
-    eligible_top = sorted(eligible_list, key=lambda x: x["alpha_score"], reverse=True)[:10]
-    actionable_top = sorted(actionable_list, key=lambda x: x["alpha_score"], reverse=True)[:5]
 
     summary = {
         "discovered_total": len(discovered),
-        "watch_total": len([x for x in watchlist if x["status"] == "WATCH"]),
-        "eligible_state_total": len([x for x in watchlist if x["status"] == "ELIGIBLE"]),
-        "actionable_state_total": len([x for x in watchlist if x["status"] == "ACTIONABLE"]),
+        "watch_total": len(watch_rows),
+        "eligible_state_total": len(eligible_rows),
+        "actionable_state_total": len(actionable_rows),
         "mapped_to_venue_total": mapped_count,
-        "eligible_total": eligible_count,
+        "eligible_total": len(eligible_rows) + len(actionable_rows),
         "alpha_pass_total": alpha_pass_count,
         "risk_pass_total": risk_pass_count,
         "cost_pass_total": cost_pass_count,
-        "proposed_total": proposed_count,
+        "proposed_total": len(actionable_rows),
         "top_reject_reasons": top_reasons,
         "sources_present": sources_present,
+        "rejects_tradable": dict(rejects_tradable),
+        "rejects_external": dict(rejects_external),
+        "alpha_scored_total": alpha_scored_count,
+        "cost_evaluated_total": cost_evaluated_count,
+        "risk_evaluated_total": risk_evaluated_count,
+        "alpha_floor_effective": 50 if alpha_floor_override_count > 0 else MIN_ACTIONABLE_SCORE,
+        "alpha_floor_overrides": alpha_floor_override_count,
+        "regime": regime,
+        "pressure_count": pressure_count,
+        "sanity": sanity,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
         "defillama_symbols_total": len(llama_syms),
@@ -1006,6 +1325,7 @@ def main() -> None:
     tg = TelegramNotifier()
     kill_switch_alerted = False
     startup_ping_sent = False
+    last_ghost_run = 0.0
     write_status({"state": "starting", "job": "boot", "kill_switch_active": is_kill_switch_active()})
     while True:
         if is_kill_switch_active():
@@ -1034,6 +1354,10 @@ def main() -> None:
             if not startup_ping_sent:
                 tg.send(build_startup_ping(summary))
                 startup_ping_sent = True
+            if time.time() - last_ghost_run >= 3600:
+                ghost = run_ghost_simulator()
+                put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
+                last_ghost_run = time.time()
             write_status({
                 "state": "cycle_complete",
                 "job": "sleeping",

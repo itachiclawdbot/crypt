@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 11:39 SGT
+Last updated: 2026-02-23 14:20 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -166,6 +166,31 @@ In the next session, load these for full context:
 - Current runtime validation:
   - DeFiLlama active with non-zero symbols,
   - Dune currently disabled/zero due to missing configured query outputs in env.
+
+### 13) Phase-2 Reliability + Bridge-Alpha upgrade wave
+- Identity normalization upgrades:
+  - canonical joins now use `instrument_symbol` (Crypto.com CCY pair like `SUI_USDT`) whenever mapped,
+  - base/quote stored separately in `universe_state` (`base_ccy`, `quote_ccy`),
+  - invalid quote assets filtered from candidate universe (`USDT/USDC/USD/EUR`) plus non-alnum symbol sanitization.
+- Funnel/reporting correctness upgrades:
+  - added additive funnel columns via runtime-safe schema migration checks:
+    - `watch_total`, `actionable_total`, `alpha_scored_total`, `cost_evaluated_total`, `risk_evaluated_total`,
+    - `rejects_tradable_json`, `rejects_external_json`, `sanity_json`, `regime`, `pressure_count`.
+  - hourly digest now prints counts/evaluated/reject splits/sanity lines and compact examples.
+- Watchlist output fix:
+  - watchlist now built from deduped ELIGIBLE universe first and never silently empty when eligible exists.
+- Dynamic social-proxy reweighting:
+  - when X/Reddit missing, strong venue+mircostructure conditions lower effective alpha floor from 70 to 50 per symbol.
+- Regime-aware OBI thresholds:
+  - regime classifier (QUIET/NORMAL/VOLATILE), OBI pressure threshold adapts by regime.
+- Bridge-alpha listing lane:
+  - added `listing_watch` + `listing_watch_events` tables,
+  - DEX + fundamentals non-tradable tokens are tracked in listing watch,
+  - new Crypto.com listing matching watch emits `listing_front_run` shadow actionable signal.
+- Ghost simulator:
+  - added `ghost_sim_runs` table and hourly async ghost simulation from rejected mapped signals (5m horizon heuristic).
+- Migration artifact added:
+  - `project_crypt/migrations/2026-02-23_phase2_reliability_bridge_alpha.sql`
 
 ---
 

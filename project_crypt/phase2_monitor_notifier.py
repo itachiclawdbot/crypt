@@ -145,15 +145,16 @@ def hourly_summary() -> str:
 
         cur.execute(
             """
-            select symbol,status,alpha_score,eligibility_score,deny_reason
+            select coalesce(instrument_symbol,symbol) as instrument_symbol, symbol,status,alpha_score,eligibility_score,deny_reason,
+                   row_number() over (partition by coalesce(instrument_symbol,symbol) order by id desc) rn
             from universe_state
-            where ts >= ?
+            where ts >= ? and coalesce(base_ccy,symbol) not in ('USDT','USDC','USD','EUR')
             order by alpha_score desc
-            limit 20
+            limit 200
             """,
             (since,),
         )
-        top = cur.fetchall()
+        top = [r for r in cur.fetchall() if r['rn'] == 1][:30]
 
         cur.execute(
             """
@@ -202,7 +203,7 @@ def hourly_summary() -> str:
         periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
 
     watch = [r for r in top if r["status"] == "WATCH"][:10]
-    eligible = [r for r in top if r["status"] in {"ELIGIBLE", "ACTIONABLE"}][:10]
+    eligible = [r for r in top if r["status"] == "ELIGIBLE"][:10]
     actionable = [r for r in top if r["status"] == "ACTIONABLE"][:5]
 
     src_txt = ", ".join(f"{r['source']}:{r['c']}" for r in by_source) or "none"
@@ -217,18 +218,30 @@ def hourly_summary() -> str:
     reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in rejects) or "none"
     pressure_txt = ", ".join(f"{r['base_symbol']}[obi={r['obi_20bps']:.2f},liq={r['liquidity_score']:.1f}]" for r in pressure) or "none"
     widest_txt = ", ".join(f"{r['base_symbol']}({r['spread_bps_p95_300']:.1f}bps)" for r in widest) or "none"
-    best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq) or "none"
+    best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq if r['base_symbol'] not in {'USDT','USDC','USD','EUR'}) or "none"
+
+    counts_line = "none"
+    eval_line = "none"
+    rejects_line = "none"
+    external_line = "none"
+    sanity_line = "none"
+    regime_line = "none"
+    sources_present_txt = "{}"
 
     if funnel:
-        funnel_txt = (
-            f"discovered={funnel['discovered_total']} mapped={funnel['mapped_to_venue_total']} "
-            f"eligible={funnel['eligible_total']} alpha={funnel['alpha_pass_total']} "
-            f"risk={funnel['risk_pass_total']} cost={funnel['cost_pass_total']} proposed={funnel['proposed_total']}"
-        )
+        counts_line = f"WATCH={funnel['watch_total'] or 0} ELIGIBLE={funnel['eligible_total'] or 0} ACTIONABLE={funnel['actionable_total'] or 0}"
+        eval_line = f"alpha_scored={funnel['alpha_scored_total'] or 0} cost_eval={funnel['cost_evaluated_total'] or 0} risk_eval={funnel['risk_evaluated_total'] or 0}"
+        rejects_line = str(funnel['rejects_tradable_json'] or '{}')
+        external_line = str(funnel['rejects_external_json'] or '{}')
+        sanity_line = str(funnel['sanity_json'] or '{}')
+        regime_line = f"regime={funnel['regime'] or '-'} pressure_count={funnel['pressure_count'] or 0}"
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
-    else:
-        funnel_txt = "none"
-        sources_present_txt = "{}"
+
+    examples = actionable[:3] if actionable else watch[:3]
+    ex_txt = "; ".join(
+        f"{r['symbol']} a={float(r['alpha_score'] or 0):.1f} status={r['status']} reason={r['deny_reason'] or '-'}"
+        for r in examples
+    ) or "none"
 
     return (
         "[Project Crypt][Phase-2][Hourly]\n"
@@ -239,7 +252,12 @@ def hourly_summary() -> str:
         f"Trending symbols: {sym_txt}\n"
         f"Potential buys under watch: {pot_txt}\n"
         f"Source health: {health_txt}\n"
-        f"Funnel: {funnel_txt}\n"
+        f"Counts: {counts_line}\n"
+        f"Evaluated: {eval_line}\n"
+        f"Rejects(tradable): {rejects_line}\n"
+        f"Rejects(external): {external_line}\n"
+        f"Sanity: {sanity_line}\n"
+        f"MicroStats: {regime_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
@@ -248,6 +266,7 @@ def hourly_summary() -> str:
         f"Micro pressure flags: {pressure_txt}\n"
         f"Micro widest spreads: {widest_txt}\n"
         f"Micro best liquidity: {best_liq_txt}\n"
+        f"Examples: {ex_txt}\n"
         f"Periodic analysis: {periodic_analysis_txt}\n"
         f"Recommended focus: {periodic_reco}"
     )
