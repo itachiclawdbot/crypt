@@ -301,6 +301,8 @@ def hourly_summary() -> str:
     sanity_line = "none"
     regime_line = "none"
     micro_cov_line = "none"
+    pre_cost_line = "none"
+    util_line = "none"
     sources_present_txt = "{}"
 
     if funnel:
@@ -322,6 +324,8 @@ def hourly_summary() -> str:
             f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
             f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
         )
+        pre_cost_line = str(sj.get('pre_cost_skip_breakdown', {}))
+        util_line = str(sj.get('avg_notional_utilization', 0))
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
     cliff_hint = "none"
@@ -353,6 +357,8 @@ def hourly_summary() -> str:
         f"Rejects(external): {external_line}\n"
         f"Sanity: {sanity_line}\n"
         f"MicroCoverage: {micro_cov_line}\n"
+        f"PreCostSkipBreakdown: {pre_cost_line}\n"
+        f"AvgNotionalUtilization(actionable): {util_line}\n"
         f"MicroStats: {regime_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"

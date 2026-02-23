@@ -1024,6 +1024,8 @@ def run_cycle() -> dict:
     invalid_assets_filtered = 0
     alpha_floor_override_count = 0
     cost_fail_breakdown: Counter = Counter()
+    pre_cost_skip: Counter = Counter()
+    notional_util_samples: list[float] = []
 
     venue_vols = [float(v.get("volume_24h_quote", 0.0)) for v in venue_metrics.values()]
     venue_spreads = [float(v.get("spread_bps", 9999.0)) for v in venue_metrics.values()]
@@ -1127,25 +1129,57 @@ def run_cycle() -> dict:
 
         expected_edge_bps = alpha_score * 0.45
 
-        # Issue-4: small-cap lane + spread-toxic bypass.
+        # Cost model upgrades:
+        # - adaptive sizing by slippage cap
+        # - dual execution-style scenarios (taker vs maker-first)
+        # - regime/liquidity adaptive safety margin
         spread_toxic = spread_bps > 80.0
-        small_cap_lane = liquidity_cover < 20.0
-        effective_notional = TARGET_NOTIONAL_USDT * (0.25 if small_cap_lane else 1.0)
-        effective_liq_cover = max(0.01, depth_20bps / max(1.0, effective_notional)) if depth_20bps > 0 else liquidity_cover
 
-        safety_margin_bps = 12.0 if not is_new_listing else 20.0
+        base_margin = 20.0 if is_new_listing else 12.0
+        if regime == "NORMAL" and liquidity_cover > 50:
+            safety_margin_bps = base_margin * 0.8
+        elif regime == "VOLATILE":
+            safety_margin_bps = base_margin * 1.0
+        else:
+            safety_margin_bps = base_margin * 0.9
+
+        k_slip = 0.08
+        slippage_cap_bps = 10.0 if regime == "VOLATILE" else (20.0 if regime == "QUIET" else 15.0)
+        max_notional_by_slip = max(1.0, depth_20bps * slippage_cap_bps / (k_slip * 10000.0)) if depth_20bps > 0 else 1.0
+        target_notional_adj = min(TARGET_NOTIONAL_USDT, max_notional_by_slip)
+        size_reduced = target_notional_adj < TARGET_NOTIONAL_USDT
+
         half_spread_bps = max(0.0, spread_bps / 2.0)
         depth = max(1.0, float(depth_20bps or 0.0))
-        slippage_depth_bps = (effective_notional / depth) * 10000.0 * 0.08
+
+        # Full-size (for audit/tuning)
+        full_liq_cover = max(0.01, depth_20bps / max(1.0, TARGET_NOTIONAL_USDT)) if depth_20bps > 0 else liquidity_cover
+        full_slippage_depth_bps = (TARGET_NOTIONAL_USDT / depth) * 10000.0 * k_slip
+        full_slippage_proxy_bps = max(2.0, 20.0 / max(1.0, full_liq_cover))
+        full_slippage_bps = max(full_slippage_proxy_bps, full_slippage_depth_bps)
+
+        # Adjusted-size (execution planner)
+        effective_liq_cover = max(0.01, depth_20bps / max(1.0, target_notional_adj)) if depth_20bps > 0 else liquidity_cover
+        slippage_depth_bps = (target_notional_adj / depth) * 10000.0 * k_slip
         slippage_proxy_bps = max(2.0, 20.0 / max(1.0, effective_liq_cover))
         slippage_bps = max(slippage_proxy_bps, slippage_depth_bps)
+
         vol_penalty_bps = min(15.0, max(0.0, float(venue.get("chg_24h_abs", 0.0)) * 100.0 * 0.3))
+
+        est_cost_bps_full_size = half_spread_bps + full_slippage_bps + vol_penalty_bps
+        taker_cost_bps = half_spread_bps + slippage_bps + vol_penalty_bps
+        maker_cost_bps = (half_spread_bps * 0.2) + (slippage_bps * 0.6) + (vol_penalty_bps * 0.8)
+
+        chosen_style = "taker"
+        est_cost_bps = taker_cost_bps
+        if maker_cost_bps < taker_cost_bps:
+            est_cost_bps = maker_cost_bps
+            chosen_style = "maker-first"
 
         if spread_toxic:
             est_cost_bps = 9999.0
             cost_edge_bps = -9999.0
         else:
-            est_cost_bps = half_spread_bps + slippage_bps + vol_penalty_bps
             cost_evaluated_count += 1
             cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
 
@@ -1166,6 +1200,7 @@ def run_cycle() -> dict:
             deny_reason = "not-tradable-external"
             reject_counter[deny_reason] += 1
             rejects_external["not_tradable"] += 1
+            pre_cost_skip["mapping_failure"] += 1
             log_reject(sym, deny_stage, deny_reason, {"mapped": mapped, "instrument_symbol": instrument_symbol})
             status = "WATCH"
         elif eligibility_score < MIN_ELIGIBLE_SCORE:
@@ -1174,6 +1209,7 @@ def run_cycle() -> dict:
             deny_reason = "eligibility-score-too-low"
             reject_counter[deny_reason] += 1
             rejects_tradable["eligibility"] += 1
+            pre_cost_skip["eligibility_fail"] += 1
             log_reject(sym, deny_stage, deny_reason, {
                 "eligibility_score": eligibility_score,
                 "volume_24h": volume_24h,
@@ -1200,6 +1236,7 @@ def run_cycle() -> dict:
                 deny_reason = "alpha-score-below-threshold"
                 reject_counter[deny_reason] += 1
                 rejects_tradable["alpha"] += 1
+                pre_cost_skip["alpha_fail"] += 1
                 log_reject(sym, deny_stage, deny_reason, {
                     "alpha_score": alpha_score,
                     "confidence": confidence,
@@ -1216,14 +1253,16 @@ def run_cycle() -> dict:
                     deny_reason = "watch-spread-toxic"
                     reject_counter[deny_reason] += 1
                     rejects_tradable["cost"] += 1
+                    pre_cost_skip["spread_toxic_bypass"] += 1
                     cost_fail_breakdown["spread_cost_dominant"] += 1
                     status = "WATCH"
                     log_reject(sym, deny_stage, deny_reason, {
                         "spread_bps": spread_bps,
                         "spread_limit_bps": 80.0,
                         "bypass_cost_eval": True,
-                        "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
-                        "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+                        "est_cost_bps_full_size": est_cost_bps_full_size,
+                        "est_cost_bps_smallcap_lane": taker_cost_bps,
+                        "execution_style": chosen_style,
                     })
                 elif cost_edge_bps < 0:
                     deny_stage = "cost"
@@ -1241,9 +1280,12 @@ def run_cycle() -> dict:
                         "est_cost_bps": est_cost_bps,
                         "safety_margin_bps": safety_margin_bps,
                         "cost_edge_bps": cost_edge_bps,
-                        "effective_notional": effective_notional,
-                        "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
-                        "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+                        "target_notional_adj": target_notional_adj,
+                        "size_reduced": size_reduced,
+                        "est_cost_bps_full_size": est_cost_bps_full_size,
+                        "est_cost_bps_smallcap_lane": taker_cost_bps,
+                        "est_cost_bps_maker": maker_cost_bps,
+                        "execution_style": chosen_style,
                         "cost_components": {
                             "spread": half_spread_bps,
                             "slippage": slippage_bps,
@@ -1270,10 +1312,13 @@ def run_cycle() -> dict:
                         proposed_count += 1
                         stage_reached = "actionable"
                         status = "ACTIONABLE"
+                        notional_util_samples.append(target_notional_adj / max(1.0, TARGET_NOTIONAL_USDT))
                         put_signal(sym, Source.SYSTEM, "actionable_candidate", {
                             "alpha_score": alpha_score,
                             "confidence": confidence,
-                            "target_notional": TARGET_NOTIONAL_USDT,
+                            "target_notional": target_notional_adj,
+                            "size_reduced": size_reduced,
+                            "execution_style": chosen_style,
                             "cost_edge_bps": cost_edge_bps,
                             "risk_flags": risk_flags,
                             "new_listing": is_new_listing,
@@ -1295,6 +1340,9 @@ def run_cycle() -> dict:
             "confidence": round(confidence, 3),
             "uncertainty": round(1.0 - confidence, 3),
             "cost_edge_bps": round(cost_edge_bps, 2),
+            "execution_style": chosen_style,
+            "size_reduced": size_reduced,
+            "target_notional_adj": round(target_notional_adj, 2),
             "risk_flags": risk_flags,
             "mapped": mapped,
             "deny_stage": deny_stage,
@@ -1319,8 +1367,12 @@ def run_cycle() -> dict:
             "is_new_listing": is_new_listing,
             "expected_edge_bps": expected_edge_bps,
             "est_cost_bps": est_cost_bps,
-            "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
-            "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+            "est_cost_bps_full_size": est_cost_bps_full_size,
+            "est_cost_bps_smallcap_lane": taker_cost_bps,
+            "est_cost_bps_maker": maker_cost_bps,
+            "execution_style": chosen_style,
+            "target_notional_adj": target_notional_adj,
+            "size_reduced": size_reduced,
             "cost_edge_bps": cost_edge_bps,
             "uncertainty": (1.0 - confidence),
             "risk_flags": risk_flags,
@@ -1363,6 +1415,8 @@ def run_cycle() -> dict:
     micro_target_k = int(os.getenv("MICRO_TOP_SYMBOLS", "150"))
     sanity = {
         "micro_target_k": micro_target_k,
+        "pre_cost_skip_breakdown": dict(pre_cost_skip),
+        "avg_notional_utilization": round((sum(notional_util_samples) / len(notional_util_samples)) if notional_util_samples else 0.0, 3),
         "eligible_unique": len({x["instrument_symbol"] for x in eligible_rows}),
         "actionable_unique": len({x["instrument_symbol"] for x in actionable_rows}),
         "duplicates_removed": duplicates_removed,
@@ -1430,6 +1484,8 @@ def run_cycle() -> dict:
         },
         "alpha_floor_effective": 50 if alpha_floor_override_count > 0 else MIN_ACTIONABLE_SCORE,
         "alpha_floor_overrides": alpha_floor_override_count,
+        "pre_cost_skip_breakdown": dict(pre_cost_skip),
+        "avg_notional_utilization": round((sum(notional_util_samples) / len(notional_util_samples)) if notional_util_samples else 0.0, 3),
         "alpha_override_active_count": alpha_floor_override_count,
         "regime": regime,
         "pressure_count": pressure_count,

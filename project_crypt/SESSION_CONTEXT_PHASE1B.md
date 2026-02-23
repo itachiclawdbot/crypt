@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 20:07 SGT
+Last updated: 2026-02-23 20:55 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -396,3 +396,24 @@ Runtime note:
   - `cost_pass->risk_pass`
   - `risk_pass->actionable`
 - Recommendation now points to actual weakest step (e.g., cost bottleneck) instead of generic final-stage over-filtering text.
+
+---
+
+## 2026-02-23 three-issue modeling pass (slippage/adaptive size + execution style + safety/pre-cost audit)
+1) Slippage-dominant mitigation via adaptive sizing
+- Added `target_notional_adj` solved from slippage-cap constraints against depth.
+- Actionable candidates can now pass with reduced size (`size_reduced=true`) instead of hard rejection.
+
+2) Execution-style aware cost model
+- Dual path modeled per candidate:
+  - taker path
+  - maker-first proxy path
+- Planner chooses cheaper feasible style (`execution_style` logged per decision).
+
+3) Safety margin + pre-cost visibility improvements
+- Safety margin now regime/liquidity adaptive (reduced in normal/high-liquidity regimes; preserved in volatile/new-listing contexts).
+- Added hourly `PreCostSkipBreakdown` + `AvgNotionalUtilization(actionable)` lines for scored-vs-costed audit.
+- Cost diagnostics now retain both:
+  - `est_cost_bps_full_size`
+  - `est_cost_bps_smallcap_lane`
+  plus maker estimate for style comparison.
