@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 19:34 SGT
+Last updated: 2026-02-23 20:07 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -378,3 +378,21 @@ Runtime note:
   - tradable active universe intersection (`universe_state` recent mapped bases),
   - excludes stable/quote-like bases (`USDT/USDC/USD/EUR/PYUSD/...`) from display lane.
 - Prevents PYUSD-like entries from contaminating top-liquidity UX output.
+
+---
+
+## 2026-02-23 final 2-issue pass (display hygiene + recommendation correctness)
+1) Liquidity display cleanup
+- Added configurable `DISPLAY_EXCLUDE_BASES` in notifier including `USAT`, `USD1` and stable/fiat proxies.
+- “Micro best liquidity” now displays only bases that are:
+  - in active decision universe (`top` decision rows), and
+  - not in `DISPLAY_EXCLUDE_BASES`.
+- This is display-layer filtering only (no hard removal from ingestion universe).
+
+2) Recommendation engine correctness
+- Reworked periodic analysis recommendation to derivative step-down bottleneck logic:
+  - `scored->costed`
+  - `costed->cost_pass`
+  - `cost_pass->risk_pass`
+  - `risk_pass->actionable`
+- Recommendation now points to actual weakest step (e.g., cost bottleneck) instead of generic final-stage over-filtering text.

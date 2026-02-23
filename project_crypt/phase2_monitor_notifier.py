@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from project_crypt.telegram_notify import TelegramNotifier
 
 DB_PATH = "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3"
+DISPLAY_EXCLUDE_BASES = {x.strip().upper() for x in ("USDT,USDC,USD,EUR,PYUSD,TUSD,USDP,BUSD,DAI,FDUSD,USDE,USAT,USD1").split(",") if x.strip()}
 
 
 def db() -> sqlite3.Connection:
@@ -45,38 +46,33 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
     scored = sum(int(r["alpha_scored_total"] or 0) for r in rows)
     costed = sum(int(r["cost_evaluated_total"] or 0) for r in rows)
     cost_pass = sum(int(r["cost_pass_total"] or 0) for r in rows)
-    risked = sum(int(r["risk_evaluated_total"] or 0) for r in rows)
     risk_pass = sum(int(r["risk_pass_total"] or 0) for r in rows)
 
-    mapping_rate = _safe_ratio(mapped, discovered)
-    eligible_rate = _safe_ratio(eligible, mapped)
-    scored_rate = _safe_ratio(scored, eligible)
-    cost_pass_rate = _safe_ratio(cost_pass, costed)
-    risk_pass_rate = _safe_ratio(risk_pass, risked)
-    actionable_rate = _safe_ratio(actionable, scored)
+    # Step-down ratios (derivative bottleneck detection)
+    r_scored_to_costed = _safe_ratio(costed, scored)
+    r_costed_to_costpass = _safe_ratio(cost_pass, costed)
+    r_costpass_to_riskpass = _safe_ratio(risk_pass, cost_pass)
+    r_riskpass_to_actionable = _safe_ratio(actionable, risk_pass)
 
     stage_rates = {
-        "mapping": mapping_rate,
-        "eligibility": eligible_rate,
-        "scored": scored_rate,
-        "cost": cost_pass_rate,
-        "risk": risk_pass_rate,
-        "actionable": actionable_rate,
+        "scored_to_costed": r_scored_to_costed,
+        "costed_to_costpass": r_costed_to_costpass,
+        "costpass_to_riskpass": r_costpass_to_riskpass,
+        "riskpass_to_actionable": r_riskpass_to_actionable,
     }
     bottleneck_stage = min(stage_rates, key=stage_rates.get)
 
     recommendation = {
-        "mapping": "Expand symbol mapping aliases and venue-availability map first.",
-        "eligibility": "Tune liquidity gates using percentile thresholds tied to target notional.",
-        "scored": "Improve feature join coverage + alpha differentiation on alts.",
-        "cost": "Adjust cost model and spread toxic filters / small-cap notional lane.",
-        "risk": "Inspect confidence calibration and cooldown logic for excessive denials.",
-        "actionable": "Inspect final proposal constraints for over-filtering.",
+        "scored_to_costed": "Improve micro-feature coverage + mapping-quality so scored candidates reach cost eval.",
+        "costed_to_costpass": "Cost gate is primary bottleneck: tune spread-toxic handling, slippage model, and small-cap lane sizing.",
+        "costpass_to_riskpass": "Risk gate is bottleneck: inspect confidence thresholds and risk flags calibration.",
+        "riskpass_to_actionable": "Final proposal stage is bottleneck: inspect final proposal constraints.",
     }[bottleneck_stage]
 
     analysis_txt = (
-        f"6h_rates mapping={mapping_rate:.2f} elig={eligible_rate:.2f} scored={scored_rate:.2f} "
-        f"cost_pass={cost_pass_rate:.2f} risk_pass={risk_pass_rate:.2f} actionable={actionable_rate:.2f}; bottleneck={bottleneck_stage}"
+        f"6h_step_rates scored->costed={r_scored_to_costed:.2f} costed->cost_pass={r_costed_to_costpass:.2f} "
+        f"cost_pass->risk_pass={r_costpass_to_riskpass:.2f} risk_pass->actionable={r_riskpass_to_actionable:.2f}; "
+        f"bottleneck={bottleneck_stage}"
     )
     return analysis_txt, recommendation
 
@@ -220,22 +216,13 @@ def hourly_summary() -> str:
 
         cur.execute(
             """
-            select m.base_symbol, m.liquidity_score
-            from micro_features_latest m
-            where m.base_symbol not in ('USDT','USDC','USD','EUR','PYUSD','TUSD','USDP','BUSD','DAI','FDUSD','USDE')
-              and exists (
-                select 1
-                from universe_state u
-                where u.ts >= ?
-                  and u.instrument_symbol is not null
-                  and coalesce(u.base_ccy,u.symbol)=m.base_symbol
-              )
-            order by m.liquidity_score desc
-            limit 6
-            """,
-            (since,),
+            select base_symbol, liquidity_score
+            from micro_features_latest
+            order by liquidity_score desc
+            limit 40
+            """
         )
-        best_liq = cur.fetchall()
+        best_liq_raw = cur.fetchall()
 
         cur.execute(
             """
@@ -273,6 +260,9 @@ def hourly_summary() -> str:
     watch_top = watch_union[:10]
     eligible = eligible[:10]
     watch = watch[:10]
+
+    active_bases = {str(r['symbol']).upper() for r in top if r['symbol']}
+    best_liq = [r for r in best_liq_raw if str(r['base_symbol']).upper() in active_bases and str(r['base_symbol']).upper() not in DISPLAY_EXCLUDE_BASES][:6]
 
     src_txt = ", ".join(f"{r['source']}:{r['c']}" for r in by_source) or "none"
     sig_txt = ", ".join(f"{r['signal_type']}:{r['c']}" for r in top_signals) or "none"
