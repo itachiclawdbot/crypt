@@ -168,6 +168,37 @@ def hourly_summary() -> str:
         )
         rejects = cur.fetchall()
 
+        cur.execute(
+            """
+            select base_symbol, obi_20bps, liquidity_score
+            from micro_features_latest
+            where pressure_flag=1
+            order by abs(obi_20bps) desc
+            limit 6
+            """
+        )
+        pressure = cur.fetchall()
+
+        cur.execute(
+            """
+            select base_symbol, spread_bps_p95_300
+            from micro_features_latest
+            order by spread_bps_p95_300 desc
+            limit 6
+            """
+        )
+        widest = cur.fetchall()
+
+        cur.execute(
+            """
+            select base_symbol, liquidity_score
+            from micro_features_latest
+            order by liquidity_score desc
+            limit 6
+            """
+        )
+        best_liq = cur.fetchall()
+
         periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
 
     watch = [r for r in top if r["status"] == "WATCH"][:10]
@@ -184,6 +215,9 @@ def hourly_summary() -> str:
     eligible_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in eligible) or "none"
     actionable_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in actionable) or "none"
     reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in rejects) or "none"
+    pressure_txt = ", ".join(f"{r['base_symbol']}[obi={r['obi_20bps']:.2f},liq={r['liquidity_score']:.1f}]" for r in pressure) or "none"
+    widest_txt = ", ".join(f"{r['base_symbol']}({r['spread_bps_p95_300']:.1f}bps)" for r in widest) or "none"
+    best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq) or "none"
 
     if funnel:
         funnel_txt = (
@@ -211,6 +245,9 @@ def hourly_summary() -> str:
         f"Top Eligible: {eligible_txt}\n"
         f"Top Actionable: {actionable_txt}\n"
         f"Top reject reasons: {reject_txt}\n"
+        f"Micro pressure flags: {pressure_txt}\n"
+        f"Micro widest spreads: {widest_txt}\n"
+        f"Micro best liquidity: {best_liq_txt}\n"
         f"Periodic analysis: {periodic_analysis_txt}\n"
         f"Recommended focus: {periodic_reco}"
     )

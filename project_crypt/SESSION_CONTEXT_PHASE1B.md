@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 10:18 SGT
+Last updated: 2026-02-23 11:16 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -104,6 +104,39 @@ In the next session, load these for full context:
   - higher safety margin,
   - higher confidence requirement.
 - Added DEX boost top endpoint ingestion (`/token-boosts/top/v1`) to strengthen attention-shock proxy signal.
+
+### 10) Microstructure Engine v1 (single-VM microservice style)
+- Added dedicated microstructure process:
+  - `project_crypt/microstructure_service.py`
+- Service behavior:
+  - pulls top Crypto.com USD/USDT symbols by quote volume,
+  - fetches orderbook snapshots (`get-book`) per symbol,
+  - computes v1 microstructure features:
+    - spread_bps,
+    - depth_usd_10bps / depth_usd_20bps,
+    - OBI_10bps / OBI_20bps,
+    - pressure_flag,
+    - orderbook_slope (log depth vs log band proxy),
+    - liquidity_score = depth20 / target_notional,
+    - rolling spread stats (median + p95).
+- Persistence layer:
+  - `micro_features_log` (time series)
+  - `micro_features_latest` (latest state per symbol)
+- Alpha/gating integration in `phase2_alpha_aggregator.py`:
+  - loads latest micro features per symbol,
+  - uses micro spread p95 for eligibility/cost context,
+  - uses depth/liquidity for cost model and risk flags,
+  - boosts alpha on pressure/OBI conditions (capped),
+  - logs micro metrics into universe state for diagnostics.
+- Notifier integration:
+  - hourly digest includes micro highlights:
+    - pressure flags,
+    - widest spreads,
+    - best liquidity symbols.
+- Runtime processes now expected:
+  - `phase2_alpha_aggregator`
+  - `phase2_monitor_notifier`
+  - `microstructure_service`
 
 ---
 

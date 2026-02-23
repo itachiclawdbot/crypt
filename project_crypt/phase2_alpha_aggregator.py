@@ -343,9 +343,12 @@ def ingest_cmc() -> set[str]:
     return out
 
 
-def estimate_cost_bps(spread_bps: float, liquidity_cover: float, volatility_abs: float) -> float:
+def estimate_cost_bps(spread_bps: float, liquidity_cover: float, volatility_abs: float, depth_usd_20bps: float | None = None) -> float:
     half_spread = max(0.0, spread_bps / 2.0)
-    slippage = max(2.0, 20.0 / max(1.0, liquidity_cover))
+    depth = max(1.0, float(depth_usd_20bps or 0.0))
+    slippage_depth = (TARGET_NOTIONAL_USDT / depth) * 10000.0 * 0.08
+    slippage_proxy = max(2.0, 20.0 / max(1.0, liquidity_cover))
+    slippage = max(slippage_proxy, slippage_depth)
     vol_penalty = min(15.0, max(0.0, volatility_abs * 100.0 * 0.3))
     return half_spread + slippage + vol_penalty
 
@@ -405,6 +408,36 @@ def ingest_news() -> int:
     return total_hits
 
 
+def load_micro_latest() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    try:
+        with db() as c:
+            cur = c.cursor()
+            cur.execute(
+                """
+                select base_symbol, spread_bps_median_300, spread_bps_p95_300, depth_usd_10bps, depth_usd_20bps,
+                       obi_10bps, obi_20bps, pressure_flag, orderbook_slope, liquidity_score, risk_flags_json
+                from micro_features_latest
+                """
+            )
+            for r in cur.fetchall():
+                out[str(r[0]).upper()] = {
+                    "spread_bps_median_300": float(r[1] or 0.0),
+                    "spread_bps_p95_300": float(r[2] or 0.0),
+                    "depth_usd_10bps": float(r[3] or 0.0),
+                    "depth_usd_20bps": float(r[4] or 0.0),
+                    "obi_10bps": float(r[5] or 0.0),
+                    "obi_20bps": float(r[6] or 0.0),
+                    "pressure_flag": bool(r[7]),
+                    "orderbook_slope": float(r[8] or 0.0),
+                    "liquidity_score": float(r[9] or 0.0),
+                    "risk_flags": json.loads(r[10] or "[]"),
+                }
+    except Exception:
+        return {}
+    return out
+
+
 def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int, venue_movers: set[str]) -> dict:
     x_on = bool(os.getenv("X_BEARER_TOKEN") or os.getenv("X_API_KEY"))
     reddit_on = bool(os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET"))
@@ -415,6 +448,7 @@ def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_
         Source.CRYPTOPANIC: news_hits >= 0,
         Source.FREE_NEWS: news_hits >= 0,
         "venue_movers": len(venue_movers) > 0,
+        "microstructure": True,
         Source.X: x_on,
         Source.REDDIT: reddit_on,
     }
@@ -580,6 +614,9 @@ def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_news"})
     news_hits = ingest_news()
 
+    write_status({"state": "running", "job": "load_micro_features"})
+    micro_latest = load_micro_latest()
+
     sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers)
     discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings))
 
@@ -606,9 +643,11 @@ def run_cycle() -> dict:
             mapped_count += 1
 
         venue = venue_metrics.get(sym, {})
+        micro = micro_latest.get(sym, {})
         volume_24h = float(venue.get("volume_24h_quote", dex_metrics.get(sym, {}).get("volume24h", 0.0)))
-        spread_bps = float(venue.get("spread_bps", 9999.0))
-        liquidity_cover = (volume_24h / max(1.0, TARGET_NOTIONAL_USDT))
+        spread_bps = float(micro.get("spread_bps_p95_300", venue.get("spread_bps", 9999.0)))
+        depth_20bps = float(micro.get("depth_usd_20bps", 0.0))
+        liquidity_cover = float(micro.get("liquidity_score", (volume_24h / max(1.0, TARGET_NOTIONAL_USDT))))
 
         eligibility_score = 0.0
         deny_stage = None
@@ -628,10 +667,16 @@ def run_cycle() -> dict:
         alpha_score, confidence, alpha_dbg = weighted_alpha(
             sym, cg, cmc, dex_latest, dex_boosted, venue_movers, mapped, sources_present, venue_metrics
         )
+        if micro.get("pressure_flag"):
+            alpha_score += 8.0
+        if abs(float(micro.get("obi_20bps", 0.0))) >= 0.70:
+            alpha_score += 3.0
+            risk_flags.append("obi_extreme")
+        alpha_score = min(100.0, alpha_score)
 
         status = "WATCH"
         stage_reached = "discovery"
-        risk_flags: list[str] = []
+        risk_flags: list[str] = list(micro.get("risk_flags", []))
         is_new_listing = sym in new_listings
         if is_new_listing:
             risk_flags.append("new_listing")
@@ -641,7 +686,12 @@ def run_cycle() -> dict:
             risk_flags.append("thin_liquidity")
 
         expected_edge_bps = alpha_score * 0.45
-        est_cost_bps = estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)))
+        est_cost_bps = estimate_cost_bps(
+            spread_bps,
+            liquidity_cover,
+            float(venue.get("chg_24h_abs", 0.0)),
+            depth_usd_20bps=depth_20bps,
+        )
         safety_margin_bps = 12.0 if not is_new_listing else 20.0
         cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
 
@@ -739,6 +789,9 @@ def run_cycle() -> dict:
             "stage_reached": stage_reached,
             "volume_24h": volume_24h,
             "spread_bps": spread_bps,
+            "depth_usd_20bps": depth_20bps,
+            "obi_20bps": float(micro.get("obi_20bps", 0.0)),
+            "pressure_flag": bool(micro.get("pressure_flag", False)),
             "dynamic_min_volume": dynamic_min_volume,
             "dynamic_max_spread_bps": dynamic_max_spread_bps,
             "liquidity_cover": liquidity_cover,
