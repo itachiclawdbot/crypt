@@ -353,6 +353,44 @@ def estimate_cost_bps(spread_bps: float, liquidity_cover: float, volatility_abs:
     return half_spread + slippage + vol_penalty
 
 
+def _chunked(items: list[str], n: int) -> list[list[str]]:
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
+def _resolve_dex_symbols(rows: list[dict]) -> dict[str, str]:
+    """Resolve tokenAddress -> symbol via DEX pairs endpoint.
+
+    token-profiles/boost endpoints often omit tokenSymbol. We enrich using:
+    /latest/dex/tokens/{addr1,addr2,...} and pick highest-liquidity pair symbol.
+    """
+    addrs = [str(r.get("tokenAddress") or "").strip() for r in rows if r.get("tokenAddress")]
+    addrs = [a for a in addrs if a]
+    if not addrs:
+        return {}
+
+    resolved: dict[str, tuple[str, float]] = {}
+    uniq = list(dict.fromkeys(addrs))
+    for batch in _chunked(uniq, 30):
+        try:
+            u = _norm_url("/latest/dex/tokens/" + ",".join(batch))
+            d = get_json(u)
+            pairs = d.get("pairs", []) if isinstance(d, dict) else []
+            for p in pairs:
+                base = p.get("baseToken", {}) or {}
+                addr = str(base.get("address") or "").strip()
+                sym = str(base.get("symbol") or "").upper().strip()
+                liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+                if not addr or not sym:
+                    continue
+                prev = resolved.get(addr)
+                if prev is None or liq > prev[1]:
+                    resolved[addr] = (sym, liq)
+        except Exception:
+            continue
+
+    return {k: v[0] for k, v in resolved.items()}
+
+
 def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
     t0 = time.time()
     boosted: set[str] = set()
@@ -365,23 +403,36 @@ def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
         l_rows = l if isinstance(l, list) else []
         b_rows = b if isinstance(b, list) else []
         bt_rows = bt if isinstance(bt, list) else []
+
+        addr_to_sym = _resolve_dex_symbols(l_rows + b_rows + bt_rows)
+
         for row in l_rows[:400]:
-            sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
+            addr = str(row.get("tokenAddress") or "").strip()
+            sym = str(row.get("tokenSymbol") or row.get("symbol") or addr_to_sym.get(addr) or "").upper()
             if sym:
                 latest.add(sym)
                 vol = float(row.get("volume") or row.get("volume24h") or 0)
                 symbol_metrics.setdefault(sym, {})["volume24h"] = max(vol, symbol_metrics.get(sym, {}).get("volume24h", 0))
-                put_signal(sym, Source.DEX, "latest_profile", {"entry": row})
+                put_signal(sym, Source.DEX, "latest_profile", {"entry": row}, conviction="watch")
+
         for row in b_rows[:400]:
-            sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
+            addr = str(row.get("tokenAddress") or "").strip()
+            sym = str(row.get("tokenSymbol") or row.get("symbol") or addr_to_sym.get(addr) or "").upper()
             if sym:
                 boosted.add(sym)
                 put_signal(sym, Source.DEX, "boosted", {"entry": row}, conviction="high")
+
         for row in bt_rows[:400]:
-            sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
+            addr = str(row.get("tokenAddress") or "").strip()
+            sym = str(row.get("tokenSymbol") or row.get("symbol") or addr_to_sym.get(addr) or "").upper()
             if sym:
                 boosted.add(sym)
                 put_signal(sym, Source.DEX, "boosted_top", {"entry": row}, conviction="high")
+
+        put_signal(None, Source.DEX, "symbol_resolution", {
+            "rows_total": len(l_rows) + len(b_rows) + len(bt_rows),
+            "resolved_symbols": len(addr_to_sym),
+        })
         log_source_health(Source.DEX, "OK", int((time.time() - t0) * 1000), len(l_rows) + len(b_rows) + len(bt_rows))
     except Exception as e:
         put_signal(None, Source.DEX, "ingest_error", {"error": str(e)})

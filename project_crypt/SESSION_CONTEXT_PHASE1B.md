@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 11:16 SGT
+Last updated: 2026-02-23 11:33 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -137,6 +137,17 @@ In the next session, load these for full context:
   - `phase2_alpha_aggregator`
   - `phase2_monitor_notifier`
   - `microstructure_service`
+
+### 11) DEXScreener attention-feed fix (profiles/boosts symbol resolution)
+- Verified DEX endpoints are reachable and healthy (200):
+  - `/token-profiles/latest/v1`
+  - `/token-boosts/latest/v1`
+  - `/token-boosts/top/v1`
+- Root issue: profile/boost payloads often do not include `tokenSymbol`/`symbol`, causing near-zero usable symbols.
+- Implemented resolver in aggregator:
+  - batches token addresses into `/latest/dex/tokens/{addr1,addr2,...}`,
+  - resolves canonical symbol from highest-liquidity pair `baseToken.symbol`.
+- Result: DEX symbols now ingest correctly (latest test window showed non-null symbol signals for profiles/boosts/top boosts).
 
 ---
 
