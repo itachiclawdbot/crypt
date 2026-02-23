@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 20:55 SGT
+Last updated: 2026-02-23 23:55 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -417,3 +417,36 @@ Runtime note:
   - `est_cost_bps_full_size`
   - `est_cost_bps_smallcap_lane`
   plus maker estimate for style comparison.
+
+---
+
+## 2026-02-23 five-issue consolidated implementation (slippage curve + safety decomposition + risk codes + maker fill-prob + pressure confidence)
+1) Curve-based slippage + adaptive k_slip
+- Migrated cost slippage from single-band depth to interpolated curve impact `b*` across depth bands 5/10/20/50 bps.
+- Added regime/liquidity/orderbook-slope calibration for `k_slip`.
+- Resizing loop now solves adjusted notional from curve slippage budget, not single-band depth.
+- Added per-decision audit fields: `k_slip_used`, `b_interpolated_full`, `b_interpolated_adj`, `impact_multiplier`.
+
+2) Safety margin decomposition + anti-double counting
+- Replaced opaque margin with components: `base + regime_component + uncertainty_component` plus floor/cap rules.
+- Margin now applied as additive-on-raw-cost guard, avoiding recursive multiplication of volatility penalties.
+- Added `safety_margin_breakdown` to decision/reject metrics.
+
+3) Risk gate as explicit second bottleneck
+- Added standardized risk reason codes:
+  - `RISK_DD_DAILY`, `RISK_DD_HOURLY`, `RISK_MAX_POSITIONS`, `RISK_CONCENTRATION`, `RISK_CHURN`, `RISK_CONSEC_LOSSES`.
+- Introduced early risk checks (max positions/concentration) before expensive late-stage logic.
+- Late risk checks now gate final actionables for drawdown/churn/consecutive-loss controls.
+- Added regime-aware max concurrency (`NORMAL` vs `VOLATILE`) via env-configurable limits.
+
+4) Maker-first expected-cost realism
+- Added maker fill probability proxy and expected-cost calculation:
+  - `E[cost] = p_fill * cost_maker + (1-p_fill) * cost_fallback`.
+- Added maker time budget and audit fields:
+  - `maker_time_budget_sec`, `p_fill_maker`, `est_cost_bps_maker_expected`.
+
+5) Micro pressure quality and confidence scoring
+- `microstructure_service.py` now persists `depth_usd_5bps` and `depth_usd_50bps` in addition to 10/20.
+- Added strict pressure confidence score based on persistence, liquidity, and spread stability.
+- Retained artifact guard for extreme OBI with thin-side depth.
+- Added hourly digest observability lines for safety breakdown and risk reason code distribution.

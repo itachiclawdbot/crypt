@@ -279,6 +279,7 @@ def hourly_summary() -> str:
     widest_txt = ", ".join(f"{r['base_symbol']}({r['spread_bps_p95_300']:.1f}bps)" for r in widest) or "none"
 
     cost_breakdown = {"spread_cost_dominant": 0, "slippage_dominant": 0, "vol_penalty_dominant": 0, "safety_margin_dominant": 0}
+    safety_components = {"base": 0.0, "regime_component": 0.0, "uncertainty_component": 0.0, "n": 0}
     for row in cost_metrics:
         try:
             m = json.loads(row['metrics_json'] or '{}')
@@ -287,11 +288,23 @@ def hourly_summary() -> str:
                 dominant = 'spread_cost_dominant'
             if dominant in cost_breakdown:
                 cost_breakdown[dominant] += 1
+            sb = m.get('safety_margin_breakdown') or {}
+            if sb:
+                safety_components["base"] += float(sb.get("base", 0.0) or 0.0)
+                safety_components["regime_component"] += float(sb.get("regime_component", 0.0) or 0.0)
+                safety_components["uncertainty_component"] += float(sb.get("uncertainty_component", 0.0) or 0.0)
+                safety_components["n"] += 1
         except Exception:
             continue
     cost_breakdown_txt = ", ".join(f"{k}:{v}" for k, v in cost_breakdown.items())
     ghost_txt = ", ".join(f"{r['reject_reason']}({r['c']},avg={float(r['a'] or 0):.1f})" for r in ghost_rows) or "none"
     best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq if r['base_symbol'] not in {'USDT','USDC','USD','EUR'}) or "none"
+    if safety_components['n'] > 0:
+        safety_line = (
+            f"base={safety_components['base']/safety_components['n']:.1f},"
+            f"regime={safety_components['regime_component']/safety_components['n']:.1f},"
+            f"uncertainty={safety_components['uncertainty_component']/safety_components['n']:.1f}"
+        )
 
     counts_line = "none"
     eval_line = "none"
@@ -303,6 +316,8 @@ def hourly_summary() -> str:
     micro_cov_line = "none"
     pre_cost_line = "none"
     util_line = "none"
+    risk_codes_line = "none"
+    safety_line = "none"
     sources_present_txt = "{}"
 
     if funnel:
@@ -326,6 +341,7 @@ def hourly_summary() -> str:
         )
         pre_cost_line = str(sj.get('pre_cost_skip_breakdown', {}))
         util_line = str(sj.get('avg_notional_utilization', 0))
+        risk_codes_line = str(sj.get('risk_reason_codes', {}))
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
     cliff_hint = "none"
@@ -367,6 +383,8 @@ def hourly_summary() -> str:
         f"Top reject reasons(decision-level): {reject_txt}\n"
         f"Event-level rejects: {event_reject_txt}\n"
         f"Cost fail breakdown: {cost_breakdown_txt}\n"
+        f"SafetyBreakdown(avg): {safety_line}\n"
+        f"Risk reason codes: {risk_codes_line}\n"
         f"AutoTuner(tradable-only ghost 6h): {ghost_txt}\n"
         f"Micro pressure flags: {pressure_txt}\n"
         f"Micro widest spreads: {widest_txt}\n"

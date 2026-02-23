@@ -434,6 +434,72 @@ def estimate_cost_bps(spread_bps: float, liquidity_cover: float, volatility_abs:
     return half_spread + slippage + vol_penalty
 
 
+def _k_slip(regime: str, liquidity_cover: float, orderbook_slope: float) -> float:
+    base = 0.08
+    if regime == "VOLATILE":
+        base *= 1.30
+    elif regime == "QUIET":
+        base *= 0.90
+    if liquidity_cover >= 30:
+        base *= 0.85
+    elif liquidity_cover < 8:
+        base *= 1.20
+    if orderbook_slope > 1.15:
+        base *= 1.12
+    elif orderbook_slope < 0.85:
+        base *= 0.93
+    return max(0.04, min(0.18, base))
+
+
+def _interpolated_impact_bps(notional: float, depth_map: dict[float, float]) -> float:
+    points = sorted([(float(k), max(1.0, float(v))) for k, v in depth_map.items()], key=lambda x: x[0])
+    if not points:
+        return 50.0
+    if notional <= points[0][1]:
+        return points[0][0]
+    for i in range(1, len(points)):
+        b0, d0 = points[i - 1]
+        b1, d1 = points[i]
+        if d0 <= notional <= d1:
+            if d1 <= d0:
+                return b1
+            ratio = (notional - d0) / (d1 - d0)
+            return b0 + ratio * (b1 - b0)
+    b_last, d_last = points[-1]
+    return b_last * max(1.0, notional / max(1.0, d_last))
+
+
+def _safety_margin_components(regime: str, is_new_listing: bool, liquidity_cover: float, volatility_abs: float, uncertainty: float) -> dict[str, float]:
+    base = 10.0 if is_new_listing else 6.0
+    regime_component = 1.0 if regime == "NORMAL" else (4.0 if regime == "VOLATILE" else 2.0)
+    uncertainty_component = max(0.0, min(8.0, uncertainty * 8.0))
+    if regime == "NORMAL" and liquidity_cover >= 25:
+        regime_component = min(regime_component, 1.5)
+    total = base + regime_component + uncertainty_component
+    floor_bps = 5.0
+    cap_bps = 12.0 if (regime == "NORMAL" and liquidity_cover >= 25 and not is_new_listing) else 22.0
+    total = max(floor_bps, min(cap_bps, total))
+    return {
+        "base": round(base, 3),
+        "regime_component": round(regime_component, 3),
+        "uncertainty_component": round(uncertainty_component, 3),
+        "floor": floor_bps,
+        "cap": cap_bps,
+        "total": round(total, 3),
+    }
+
+
+def _maker_fill_probability(spread_bps: float, vol_abs: float, obi_abs: float, spread_stability: float, trade_rate_proxy: float, time_budget_sec: int) -> float:
+    p = 0.55
+    p -= min(0.25, spread_bps / 500.0)
+    p -= min(0.15, obi_abs / 4.0)
+    p += min(0.18, vol_abs * 2.0)
+    p += 0.15 * max(0.0, min(1.0, spread_stability))
+    p += 0.12 * max(0.0, min(1.0, trade_rate_proxy / 1.5))
+    p += min(0.08, max(0, time_budget_sec - 30) / 600.0)
+    return max(0.05, min(0.95, p))
+
+
 def _chunked(items: list[str], n: int) -> list[list[str]]:
     return [items[i : i + n] for i in range(0, len(items), n)]
 
@@ -621,23 +687,33 @@ def load_micro_latest() -> dict[str, dict]:
             cur = c.cursor()
             cur.execute(
                 """
-                select base_symbol, spread_bps_median_300, spread_bps_p95_300, depth_usd_10bps, depth_usd_20bps,
-                       obi_10bps, obi_20bps, pressure_flag, orderbook_slope, liquidity_score, risk_flags_json
+                select base_symbol, spread_bps_median_300, spread_bps_p95_300, depth_usd_5bps, depth_usd_10bps, depth_usd_20bps, depth_usd_50bps,
+                       obi_10bps, obi_20bps, pressure_flag, pressure_confidence, orderbook_slope, liquidity_score, risk_flags_json, payload_json
                 from micro_features_latest
                 """
             )
             for r in cur.fetchall():
+                payload = {}
+                try:
+                    payload = json.loads(r[14] or "{}")
+                except Exception:
+                    payload = {}
                 out[str(r[0]).upper()] = {
                     "spread_bps_median_300": float(r[1] or 0.0),
                     "spread_bps_p95_300": float(r[2] or 0.0),
-                    "depth_usd_10bps": float(r[3] or 0.0),
-                    "depth_usd_20bps": float(r[4] or 0.0),
-                    "obi_10bps": float(r[5] or 0.0),
-                    "obi_20bps": float(r[6] or 0.0),
-                    "pressure_flag": bool(r[7]),
-                    "orderbook_slope": float(r[8] or 0.0),
-                    "liquidity_score": float(r[9] or 0.0),
-                    "risk_flags": json.loads(r[10] or "[]"),
+                    "depth_usd_5bps": float(r[3] or 0.0),
+                    "depth_usd_10bps": float(r[4] or 0.0),
+                    "depth_usd_20bps": float(r[5] or 0.0),
+                    "depth_usd_50bps": float(r[6] or 0.0),
+                    "obi_10bps": float(r[7] or 0.0),
+                    "obi_20bps": float(r[8] or 0.0),
+                    "pressure_flag": bool(r[9]),
+                    "pressure_confidence": float(r[10] or 0.0),
+                    "orderbook_slope": float(r[11] or 0.0),
+                    "liquidity_score": float(r[12] or 0.0),
+                    "risk_flags": json.loads(r[13] or "[]"),
+                    "spread_stability": float(payload.get("spread_stability", 0.0) or 0.0),
+                    "trade_rate_proxy": float(payload.get("trade_rate_proxy", 0.0) or 0.0),
                 }
     except Exception:
         return {}
@@ -1009,6 +1085,7 @@ def run_cycle() -> dict:
     reject_counter: Counter = Counter()
     rejects_tradable: Counter = Counter()
     rejects_external: Counter = Counter()
+    risk_code_counter: Counter = Counter()
 
     watchlist: list[dict] = []
     eligible_list: list[dict] = []
@@ -1082,7 +1159,9 @@ def run_cycle() -> dict:
         micro = micro_latest.get(sym, {})
         volume_24h = float(venue.get("volume_24h_quote", dex_metrics.get(sym, {}).get("volume24h", 0.0)))
         spread_bps = float(micro.get("spread_bps_p95_300", venue.get("spread_bps", 9999.0)))
+        depth_5bps = float(micro.get("depth_usd_5bps", 0.0))
         depth_20bps = float(micro.get("depth_usd_20bps", 0.0))
+        depth_50bps = float(micro.get("depth_usd_50bps", depth_20bps))
         liquidity_cover = float(micro.get("liquidity_score", (volume_24h / max(1.0, TARGET_NOTIONAL_USDT))))
 
         eligibility_score = 0.0
@@ -1107,10 +1186,11 @@ def run_cycle() -> dict:
         )
         alpha_scored_count += 1
         obi20 = abs(float(micro.get("obi_20bps", 0.0)))
-        pressure_flag = (obi20 >= obi_threshold) and (liquidity_cover >= 10.0) and (spread_bps <= 80.0)
+        pressure_flag = bool(micro.get("pressure_flag", False))
+        pressure_confidence = float(micro.get("pressure_confidence", 0.0))
         if pressure_flag:
             pressure_count += 1
-            alpha_score += 8.0
+            alpha_score += (4.0 + 6.0 * pressure_confidence)
             risk_flags.append("pressure_flag")
         if regime == "VOLATILE" and obi20 >= 0.85:
             alpha_score += 3.0
@@ -1130,50 +1210,56 @@ def run_cycle() -> dict:
         expected_edge_bps = alpha_score * 0.45
 
         # Cost model upgrades:
-        # - adaptive sizing by slippage cap
-        # - dual execution-style scenarios (taker vs maker-first)
-        # - regime/liquidity adaptive safety margin
+        # - curve-based slippage using depth bands (5/10/20/50 bps)
+        # - maker-first with probabilistic fill model
+        # - decomposed safety margin with anti-double-counting guard
         spread_toxic = spread_bps > 80.0
+        uncertainty = max(0.0, min(1.0, 1.0 - confidence))
+        safety_margin = _safety_margin_components(regime, is_new_listing, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), uncertainty)
+        safety_margin_bps = float(safety_margin["total"])
 
-        base_margin = 20.0 if is_new_listing else 12.0
-        if regime == "NORMAL" and liquidity_cover > 50:
-            safety_margin_bps = base_margin * 0.8
-        elif regime == "VOLATILE":
-            safety_margin_bps = base_margin * 1.0
-        else:
-            safety_margin_bps = base_margin * 0.9
-
-        k_slip = 0.08
+        depth_curve = {
+            5.0: max(1.0, depth_5bps),
+            10.0: max(1.0, float(micro.get("depth_usd_10bps", depth_20bps * 0.65))),
+            20.0: max(1.0, depth_20bps),
+            50.0: max(1.0, depth_50bps),
+        }
+        k_slip = _k_slip(regime, liquidity_cover, float(micro.get("orderbook_slope", 1.0)))
+        impact_multiplier = max(0.75, min(1.6, k_slip / 0.08))
         slippage_cap_bps = 10.0 if regime == "VOLATILE" else (20.0 if regime == "QUIET" else 15.0)
-        max_notional_by_slip = max(1.0, depth_20bps * slippage_cap_bps / (k_slip * 10000.0)) if depth_20bps > 0 else 1.0
+
+        b_star_full = _interpolated_impact_bps(TARGET_NOTIONAL_USDT, depth_curve)
+        full_slippage_bps = b_star_full * impact_multiplier
+        max_notional_by_slip = max(1.0, TARGET_NOTIONAL_USDT * (slippage_cap_bps / max(1.0, full_slippage_bps)))
         target_notional_adj = min(TARGET_NOTIONAL_USDT, max_notional_by_slip)
         size_reduced = target_notional_adj < TARGET_NOTIONAL_USDT
 
+        b_star_adj = _interpolated_impact_bps(target_notional_adj, depth_curve)
+        slippage_bps = b_star_adj * impact_multiplier
+
         half_spread_bps = max(0.0, spread_bps / 2.0)
-        depth = max(1.0, float(depth_20bps or 0.0))
-
-        # Full-size (for audit/tuning)
-        full_liq_cover = max(0.01, depth_20bps / max(1.0, TARGET_NOTIONAL_USDT)) if depth_20bps > 0 else liquidity_cover
-        full_slippage_depth_bps = (TARGET_NOTIONAL_USDT / depth) * 10000.0 * k_slip
-        full_slippage_proxy_bps = max(2.0, 20.0 / max(1.0, full_liq_cover))
-        full_slippage_bps = max(full_slippage_proxy_bps, full_slippage_depth_bps)
-
-        # Adjusted-size (execution planner)
-        effective_liq_cover = max(0.01, depth_20bps / max(1.0, target_notional_adj)) if depth_20bps > 0 else liquidity_cover
-        slippage_depth_bps = (target_notional_adj / depth) * 10000.0 * k_slip
-        slippage_proxy_bps = max(2.0, 20.0 / max(1.0, effective_liq_cover))
-        slippage_bps = max(slippage_proxy_bps, slippage_depth_bps)
-
         vol_penalty_bps = min(15.0, max(0.0, float(venue.get("chg_24h_abs", 0.0)) * 100.0 * 0.3))
 
-        est_cost_bps_full_size = half_spread_bps + full_slippage_bps + vol_penalty_bps
+        est_cost_bps_full_size = half_spread_bps + full_slippage_bps + vol_penalty_bps + (half_spread_bps * max(0.0, safety_margin_bps - 1.0) / 100.0)
         taker_cost_bps = half_spread_bps + slippage_bps + vol_penalty_bps
         maker_cost_bps = (half_spread_bps * 0.2) + (slippage_bps * 0.6) + (vol_penalty_bps * 0.8)
 
+        maker_time_budget_sec = 45 if regime == "NORMAL" else 25
+        p_fill_maker = _maker_fill_probability(
+            spread_bps=spread_bps,
+            vol_abs=float(venue.get("chg_24h_abs", 0.0)),
+            obi_abs=obi20,
+            spread_stability=float(micro.get("spread_stability", 0.0)),
+            trade_rate_proxy=float(micro.get("trade_rate_proxy", 0.0)),
+            time_budget_sec=maker_time_budget_sec,
+        )
+        maker_fallback_cost = taker_cost_bps
+        maker_expected_cost_bps = (p_fill_maker * maker_cost_bps) + ((1.0 - p_fill_maker) * maker_fallback_cost)
+
         chosen_style = "taker"
         est_cost_bps = taker_cost_bps
-        if maker_cost_bps < taker_cost_bps:
-            est_cost_bps = maker_cost_bps
+        if maker_expected_cost_bps < taker_cost_bps:
+            est_cost_bps = maker_expected_cost_bps
             chosen_style = "maker-first"
 
         if spread_toxic:
@@ -1181,7 +1267,11 @@ def run_cycle() -> dict:
             cost_edge_bps = -9999.0
         else:
             cost_evaluated_count += 1
-            cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
+            raw_cost = half_spread_bps + slippage_bps
+            vol_adjusted_cost = raw_cost + vol_penalty_bps
+            margin_addon = raw_cost * (safety_margin_bps / 100.0)
+            est_cost_bps = est_cost_bps + margin_addon
+            cost_edge_bps = expected_edge_bps - est_cost_bps
 
         if sym in front_run_symbols and mapped:
             status = "ACTIONABLE"
@@ -1223,6 +1313,21 @@ def run_cycle() -> dict:
             eligible_count += 1
             stage_reached = "eligibility"
             status = "ELIGIBLE"
+
+            # Early/static risk checks (cheap filters)
+            max_positions_normal = int(os.getenv("PHASE2_MAX_CONCURRENT_NORMAL", "10"))
+            max_positions_volatile = int(os.getenv("PHASE2_MAX_CONCURRENT_VOLATILE", "3"))
+            max_positions = max_positions_volatile if regime == "VOLATILE" else max_positions_normal
+            max_symbol_concentration = int(os.getenv("PHASE2_MAX_SYMBOL_CONCENTRATION", "1"))
+            current_same_symbol = sum(1 for r in actionable_list if r.get("symbol") == sym)
+            early_risk_block = None
+            if proposed_count >= max_positions:
+                early_risk_block = "RISK_MAX_POSITIONS"
+                log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "regime": regime, "check_phase": "early"})
+            elif current_same_symbol >= max_symbol_concentration:
+                early_risk_block = "RISK_CONCENTRATION"
+                log_reject(sym, "risk", early_risk_block, {"symbol": sym, "max_symbol_concentration": max_symbol_concentration, "check_phase": "early"})
+
             alpha_floor_effective = MIN_ACTIONABLE_SCORE
             if (not sources_present.get(Source.X) and not sources_present.get(Source.REDDIT) and sym in venue_movers and obi20 >= 0.5 and liquidity_cover >= 20):
                 alpha_floor_effective = 50.0
@@ -1230,7 +1335,14 @@ def run_cycle() -> dict:
             alpha_gate_pass = (alpha_score >= alpha_floor_effective)
             if social_missing and sym in topk_alpha_syms:
                 alpha_gate_pass = True
-            if not alpha_gate_pass:
+            if early_risk_block:
+                deny_stage = "risk"
+                stage_reached = "risk"
+                deny_reason = early_risk_block
+                reject_counter[deny_reason] += 1
+                rejects_tradable["risk"] += 1
+                risk_code_counter[deny_reason] += 1
+            elif not alpha_gate_pass:
                 deny_stage = "alpha"
                 stage_reached = "alpha"
                 deny_reason = "alpha-score-below-threshold"
@@ -1263,6 +1375,9 @@ def run_cycle() -> dict:
                         "est_cost_bps_full_size": est_cost_bps_full_size,
                         "est_cost_bps_smallcap_lane": taker_cost_bps,
                         "execution_style": chosen_style,
+                        "k_slip_used": k_slip,
+                        "b_interpolated_full": b_star_full,
+                        "p_fill_maker": p_fill_maker,
                     })
                 elif cost_edge_bps < 0:
                     deny_stage = "cost"
@@ -1285,7 +1400,15 @@ def run_cycle() -> dict:
                         "est_cost_bps_full_size": est_cost_bps_full_size,
                         "est_cost_bps_smallcap_lane": taker_cost_bps,
                         "est_cost_bps_maker": maker_cost_bps,
+                        "est_cost_bps_maker_expected": maker_expected_cost_bps,
                         "execution_style": chosen_style,
+                        "k_slip_used": k_slip,
+                        "b_interpolated_full": b_star_full,
+                        "b_interpolated_adj": b_star_adj,
+                        "impact_multiplier": impact_multiplier,
+                        "p_fill_maker": p_fill_maker,
+                        "maker_time_budget_sec": maker_time_budget_sec,
+                        "safety_margin_breakdown": safety_margin,
                         "cost_components": {
                             "spread": half_spread_bps,
                             "slippage": slippage_bps,
@@ -1299,14 +1422,34 @@ def run_cycle() -> dict:
                     stage_reached = "cost"
                     min_conf = 0.55 if not is_new_listing else 0.65
                     risk_evaluated_count += 1
-                    risk_block = confidence < min_conf
-                    if risk_block:
+
+                    risk_reason_code = None
+                    if confidence < min_conf:
+                        risk_reason_code = "RISK_CHURN"
+                    else:
+                        with db() as _c:
+                            _cur = _c.cursor()
+                            _cur.execute("select avg(net_pnl_bps) from ghost_sim_runs where ts >= datetime('now','-1 hour')")
+                            hourly_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
+                            _cur.execute("select avg(net_pnl_bps) from ghost_sim_runs where ts >= datetime('now','-24 hours')")
+                            daily_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
+                            _cur.execute("select count(*) from ghost_sim_runs where ts >= datetime('now','-6 hours') and net_pnl_bps < 0")
+                            consec_losses = int((_cur.fetchone() or [0])[0] or 0)
+                        if daily_pnl <= -40:
+                            risk_reason_code = "RISK_DD_DAILY"
+                        elif hourly_pnl <= -20:
+                            risk_reason_code = "RISK_DD_HOURLY"
+                        elif consec_losses >= 8:
+                            risk_reason_code = "RISK_CONSEC_LOSSES"
+
+                    if risk_reason_code:
                         deny_stage = "risk"
                         stage_reached = "risk"
-                        deny_reason = "confidence-too-low"
+                        deny_reason = risk_reason_code
                         reject_counter[deny_reason] += 1
                         rejects_tradable["risk"] += 1
-                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf})
+                        risk_code_counter[deny_reason] += 1
+                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf, "regime": regime})
                     else:
                         risk_pass_count += 1
                         proposed_count += 1
@@ -1358,9 +1501,12 @@ def run_cycle() -> dict:
             "stage_reached": stage_reached,
             "volume_24h": volume_24h,
             "spread_bps": spread_bps,
+            "depth_usd_5bps": depth_5bps,
             "depth_usd_20bps": depth_20bps,
+            "depth_usd_50bps": depth_50bps,
             "obi_20bps": float(micro.get("obi_20bps", 0.0)),
             "pressure_flag": bool(micro.get("pressure_flag", False)),
+            "pressure_confidence": pressure_confidence,
             "dynamic_min_volume": dynamic_min_volume,
             "dynamic_max_spread_bps": dynamic_max_spread_bps,
             "liquidity_cover": liquidity_cover,
@@ -1370,9 +1516,17 @@ def run_cycle() -> dict:
             "est_cost_bps_full_size": est_cost_bps_full_size,
             "est_cost_bps_smallcap_lane": taker_cost_bps,
             "est_cost_bps_maker": maker_cost_bps,
+            "est_cost_bps_maker_expected": maker_expected_cost_bps,
             "execution_style": chosen_style,
             "target_notional_adj": target_notional_adj,
             "size_reduced": size_reduced,
+            "k_slip_used": k_slip,
+            "b_interpolated_full": b_star_full,
+            "b_interpolated_adj": b_star_adj,
+            "impact_multiplier": impact_multiplier,
+            "p_fill_maker": p_fill_maker,
+            "maker_time_budget_sec": maker_time_budget_sec,
+            "safety_margin_breakdown": safety_margin,
             "cost_edge_bps": cost_edge_bps,
             "uncertainty": (1.0 - confidence),
             "risk_flags": risk_flags,
@@ -1428,6 +1582,7 @@ def run_cycle() -> dict:
             "dex": round(dex_join / denom, 3),
         },
         "micro_join_fail": micro_join_fail,
+        "risk_reason_codes": dict(risk_code_counter),
     }
 
     log_funnel(

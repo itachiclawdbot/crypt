@@ -30,6 +30,14 @@ def db() -> sqlite3.Connection:
     return c
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {r[1] for r in cur.fetchall()}
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
 def init_tables() -> None:
     with db() as c:
         c.execute(
@@ -43,11 +51,14 @@ def init_tables() -> None:
                 spread_bps_median_60 REAL,
                 spread_bps_median_300 REAL,
                 spread_bps_p95_300 REAL,
+                depth_usd_5bps REAL,
                 depth_usd_10bps REAL,
                 depth_usd_20bps REAL,
+                depth_usd_50bps REAL,
                 obi_10bps REAL,
                 obi_20bps REAL,
                 pressure_flag INTEGER,
+                pressure_confidence REAL,
                 orderbook_slope REAL,
                 liquidity_score REAL,
                 risk_flags_json TEXT,
@@ -65,11 +76,14 @@ def init_tables() -> None:
                 spread_bps_median_60 REAL,
                 spread_bps_median_300 REAL,
                 spread_bps_p95_300 REAL,
+                depth_usd_5bps REAL,
                 depth_usd_10bps REAL,
                 depth_usd_20bps REAL,
+                depth_usd_50bps REAL,
                 obi_10bps REAL,
                 obi_20bps REAL,
                 pressure_flag INTEGER,
+                pressure_confidence REAL,
                 orderbook_slope REAL,
                 liquidity_score REAL,
                 risk_flags_json TEXT,
@@ -77,6 +91,12 @@ def init_tables() -> None:
             )
             """
         )
+        _ensure_column(c, "micro_features_log", "depth_usd_5bps", "REAL")
+        _ensure_column(c, "micro_features_log", "depth_usd_50bps", "REAL")
+        _ensure_column(c, "micro_features_log", "pressure_confidence", "REAL")
+        _ensure_column(c, "micro_features_latest", "depth_usd_5bps", "REAL")
+        _ensure_column(c, "micro_features_latest", "depth_usd_50bps", "REAL")
+        _ensure_column(c, "micro_features_latest", "pressure_confidence", "REAL")
 
 
 def get_json(url: str) -> dict | list:
@@ -229,18 +249,28 @@ def compute_snapshot_features(symbol: str) -> dict | None:
 
     spread_bps = ((best_ask - best_bid) / mid) * 10000.0
 
+    b5_low = mid * (1 - 5 / 10000)
+    a5_high = mid * (1 + 5 / 10000)
     b10_low = mid * (1 - 10 / 10000)
     a10_high = mid * (1 + 10 / 10000)
     b20_low = mid * (1 - 20 / 10000)
     a20_high = mid * (1 + 20 / 10000)
+    b50_low = mid * (1 - 50 / 10000)
+    a50_high = mid * (1 + 50 / 10000)
 
+    bid5 = depth_usd_in_band(b, b5_low, mid)
+    ask5 = depth_usd_in_band(a, mid, a5_high)
     bid10 = depth_usd_in_band(b, b10_low, mid)
     ask10 = depth_usd_in_band(a, mid, a10_high)
     bid20 = depth_usd_in_band(b, b20_low, mid)
     ask20 = depth_usd_in_band(a, mid, a20_high)
+    bid50 = depth_usd_in_band(b, b50_low, mid)
+    ask50 = depth_usd_in_band(a, mid, a50_high)
 
+    depth5 = bid5 + ask5
     depth10 = bid10 + ask10
     depth20 = bid20 + ask20
+    depth50 = bid50 + ask50
     eps = 1e-9
     obi10 = (bid10 - ask10) / (depth10 + eps)
     obi20 = (bid20 - ask20) / (depth20 + eps)
@@ -263,6 +293,7 @@ def compute_snapshot_features(symbol: str) -> dict | None:
     slope = num / den
 
     liq_score = depth20 / max(1.0, TARGET_NOTIONAL_USDT)
+    trade_rate_proxy = max(0.0, min(2.0, math.log10(1.0 + depth50 / max(1.0, TARGET_NOTIONAL_USDT))))
 
     # Issue-2 fix: pressure requires both OBI condition AND adequate liquidity, plus non-toxic spread.
     pressure = bool(pressure_raw and liq_score >= 10.0 and spread_bps <= 80.0)
@@ -279,8 +310,10 @@ def compute_snapshot_features(symbol: str) -> dict | None:
         "symbol": symbol,
         "base_symbol": symbol.split("_")[0].upper(),
         "spread_bps": spread_bps,
+        "depth_usd_5bps": depth5,
         "depth_usd_10bps": depth10,
         "depth_usd_20bps": depth20,
+        "depth_usd_50bps": depth50,
         "bid_depth_usd_20bps": bid20,
         "ask_depth_usd_20bps": ask20,
         "obi_10bps": obi10,
@@ -289,6 +322,7 @@ def compute_snapshot_features(symbol: str) -> dict | None:
         "pressure_flag": pressure,
         "orderbook_slope": slope,
         "liquidity_score": liq_score,
+        "trade_rate_proxy": trade_rate_proxy,
         "risk_flags": flags,
     }
 
@@ -318,6 +352,9 @@ def enrich_rolling(f: dict) -> dict:
         f["spread_bps_p95_300"] = f["spread_bps"]
 
     f["spread_bps_median_60"] = statistics.median(spreads_5m[-12:]) if spreads_5m else f["spread_bps"]
+    spread_p95 = max(1e-6, float(f.get("spread_bps_p95_300", f["spread_bps"])))
+    spread_med = max(0.0, float(f.get("spread_bps_median_300", f["spread_bps"])))
+    f["spread_stability"] = max(0.0, min(1.0, 1.0 - (spread_p95 - spread_med) / spread_p95))
     return f
 
 
@@ -328,8 +365,8 @@ def persist_feature(f: dict) -> None:
             """
             INSERT INTO micro_features_log (
                 ts,symbol,base_symbol,spread_bps,spread_bps_median_60,spread_bps_median_300,spread_bps_p95_300,
-                depth_usd_10bps,depth_usd_20bps,obi_10bps,obi_20bps,pressure_flag,orderbook_slope,liquidity_score,risk_flags_json,payload_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                depth_usd_5bps,depth_usd_10bps,depth_usd_20bps,depth_usd_50bps,obi_10bps,obi_20bps,pressure_flag,pressure_confidence,orderbook_slope,liquidity_score,risk_flags_json,payload_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 utc_now(),
@@ -339,11 +376,14 @@ def persist_feature(f: dict) -> None:
                 f["spread_bps_median_60"],
                 f["spread_bps_median_300"],
                 f["spread_bps_p95_300"],
+                f["depth_usd_5bps"],
                 f["depth_usd_10bps"],
                 f["depth_usd_20bps"],
+                f["depth_usd_50bps"],
                 f["obi_10bps"],
                 f["obi_20bps"],
                 int(bool(f["pressure_flag"])),
+                float(f.get("pressure_confidence", 0.0)),
                 f["orderbook_slope"],
                 f["liquidity_score"],
                 json.dumps(f.get("risk_flags", [])),
@@ -354,14 +394,15 @@ def persist_feature(f: dict) -> None:
             """
             INSERT INTO micro_features_latest (
                 symbol,base_symbol,ts,spread_bps,spread_bps_median_60,spread_bps_median_300,spread_bps_p95_300,
-                depth_usd_10bps,depth_usd_20bps,obi_10bps,obi_20bps,pressure_flag,orderbook_slope,liquidity_score,risk_flags_json,payload_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                depth_usd_5bps,depth_usd_10bps,depth_usd_20bps,depth_usd_50bps,obi_10bps,obi_20bps,pressure_flag,pressure_confidence,orderbook_slope,liquidity_score,risk_flags_json,payload_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 base_symbol=excluded.base_symbol, ts=excluded.ts, spread_bps=excluded.spread_bps,
                 spread_bps_median_60=excluded.spread_bps_median_60, spread_bps_median_300=excluded.spread_bps_median_300,
-                spread_bps_p95_300=excluded.spread_bps_p95_300, depth_usd_10bps=excluded.depth_usd_10bps,
-                depth_usd_20bps=excluded.depth_usd_20bps, obi_10bps=excluded.obi_10bps, obi_20bps=excluded.obi_20bps,
-                pressure_flag=excluded.pressure_flag, orderbook_slope=excluded.orderbook_slope,
+                spread_bps_p95_300=excluded.spread_bps_p95_300, depth_usd_5bps=excluded.depth_usd_5bps,
+                depth_usd_10bps=excluded.depth_usd_10bps, depth_usd_20bps=excluded.depth_usd_20bps, depth_usd_50bps=excluded.depth_usd_50bps,
+                obi_10bps=excluded.obi_10bps, obi_20bps=excluded.obi_20bps,
+                pressure_flag=excluded.pressure_flag, pressure_confidence=excluded.pressure_confidence, orderbook_slope=excluded.orderbook_slope,
                 liquidity_score=excluded.liquidity_score, risk_flags_json=excluded.risk_flags_json, payload_json=excluded.payload_json
             """,
             (
@@ -372,11 +413,14 @@ def persist_feature(f: dict) -> None:
                 f["spread_bps_median_60"],
                 f["spread_bps_median_300"],
                 f["spread_bps_p95_300"],
+                f["depth_usd_5bps"],
                 f["depth_usd_10bps"],
                 f["depth_usd_20bps"],
+                f["depth_usd_50bps"],
                 f["obi_10bps"],
                 f["obi_20bps"],
                 int(bool(f["pressure_flag"])),
+                float(f.get("pressure_confidence", 0.0)),
                 f["orderbook_slope"],
                 f["liquidity_score"],
                 json.dumps(f.get("risk_flags", [])),
@@ -429,6 +473,13 @@ def main() -> None:
                     f["pressure_persistence_count"] = count
                     f["pressure_held_seconds"] = round(held_secs, 2)
                     f["obi_artifact_guard"] = artifact
+                    persist_score = max(0.0, min(1.0, max(count / 4.0, held_secs / 120.0)))
+                    liquidity_score = max(0.0, min(1.0, float(f.get("liquidity_score", 0.0)) / 25.0))
+                    spread_stability = float(f.get("spread_stability", 0.0))
+                    pressure_confidence = (0.5 * persist_score) + (0.3 * liquidity_score) + (0.2 * spread_stability)
+                    if artifact:
+                        pressure_confidence *= 0.2
+                    f["pressure_confidence"] = round(max(0.0, min(1.0, pressure_confidence)), 3)
 
                     if extreme_obi:
                         f.setdefault("risk_flags", []).append("obi_extreme_debug")
