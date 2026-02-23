@@ -34,12 +34,79 @@ def render() -> str:
     status = read_status()
     agg = pgrep("python3 -m project_crypt.phase2_alpha_aggregator")
     mon = pgrep("python3 -m project_crypt.phase2_monitor_notifier")
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    since_1h = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
     with db() as c:
         cur = c.cursor()
-        cur.execute("select count(*) from intel_cache where ts >= ?", (since,))
-        fetched = cur.fetchone()[0]
+        cur.execute("select count(*) from intel_cache where ts >= ?", (since_24h,))
+        fetched_24h = cur.fetchone()[0]
+
+        cur.execute("select count(*) from intel_cache where ts >= ?", (since_1h,))
+        fetched_1h = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            select source, count(*) c
+            from intel_cache
+            where ts >= ?
+            group by source
+            order by c desc
+            limit 8
+            """,
+            (since_1h,),
+        )
+        by_source = cur.fetchall()
+
+        cur.execute(
+            """
+            select signal_type, count(*) c
+            from intel_cache
+            where ts >= ?
+            group by signal_type
+            order by c desc
+            limit 8
+            """,
+            (since_1h,),
+        )
+        trend_signals = cur.fetchall()
+
+        cur.execute(
+            """
+            select symbol, count(*) c
+            from intel_cache
+            where ts >= ? and symbol is not null
+            group by symbol
+            order by c desc
+            limit 10
+            """,
+            (since_1h,),
+        )
+        trending_symbols = cur.fetchall()
+
+        cur.execute(
+            """
+            select symbol, conviction, ts
+            from intel_cache
+            where ts >= ? and signal_type in ('triangulated_alpha','actionable_candidate')
+            order by id desc
+            limit 10
+            """,
+            (since_1h,),
+        )
+        potential_buys = cur.fetchall()
+
+        cur.execute(
+            """
+            select source_name, status, count(*) c
+            from source_health_log
+            where ts >= ?
+            group by source_name, status
+            order by source_name, c desc
+            """,
+            (since_1h,),
+        )
+        source_health = cur.fetchall()
 
         cur.execute(
             """
@@ -55,7 +122,7 @@ def render() -> str:
             select symbol,status,alpha_score,eligibility_score,deny_reason,ts
             from universe_state
             order by id desc
-            limit 40
+            limit 50
             """
         )
         universe = cur.fetchall()
@@ -69,7 +136,7 @@ def render() -> str:
             order by c desc
             limit 10
             """,
-            (since,),
+            (since_24h,),
         )
         rejects = cur.fetchall()
 
@@ -79,17 +146,25 @@ def render() -> str:
 
     lines = [
         "PROJECT CRYPT PHASE-2 OPS DASHBOARD",
-        "=" * 80,
+        "=" * 100,
         f"Now: {now}",
         f"Aggregator: {agg}",
         f"Notifier:   {mon}",
-        "-" * 80,
+        "-" * 100,
         f"Current job: {status.get('job')}",
         f"State:       {status.get('state')}",
         f"Last update: {status.get('ts')}",
         f"Kill switch active: {status.get('kill_switch_active')}",
-        f"Fetched last 24h: {fetched}",
-        "-" * 80,
+        f"Tick config: market={status.get('next_market_tick_s')}s discovery={status.get('next_discovery_tick_s')}s",
+        f"Fetched signals: last1h={fetched_1h} last24h={fetched_24h}",
+        "-" * 100,
+        "SOURCE/SIGNAL ACTIVITY (last 1h)",
+        " by_source: " + (", ".join(f"{r['source']}:{r['c']}" for r in by_source) or "none"),
+        " trend_signals: " + (", ".join(f"{r['signal_type']}:{r['c']}" for r in trend_signals) or "none"),
+        " trending_symbols: " + (", ".join(f"{r['symbol']}({r['c']})" for r in trending_symbols if r['symbol']) or "none"),
+        " potential_buys: " + (", ".join(f"{r['symbol']}[{r['conviction']}]" for r in potential_buys if r['symbol']) or "none"),
+        " source_health: " + (", ".join(f"{r['source_name']}={r['status']}({r['c']})" for r in source_health) or "none"),
+        "-" * 100,
         "FUNNEL",
     ]
 
@@ -105,20 +180,20 @@ def render() -> str:
     else:
         lines.append(" no funnel data yet")
 
-    lines += ["-" * 80, "TOP WATCHLIST"]
+    lines += ["-" * 100, "TOP WATCHLIST"]
     lines += [f" - {r['symbol']} a={r['alpha_score']:.1f} e={r['eligibility_score']:.1f} deny={r['deny_reason'] or '-'}" for r in watch] or [" - none"]
 
-    lines += ["-" * 80, "TOP ELIGIBLE"]
+    lines += ["-" * 100, "TOP ELIGIBLE"]
     lines += [f" - {r['symbol']} a={r['alpha_score']:.1f} e={r['eligibility_score']:.1f} status={r['status']}" for r in eligible] or [" - none"]
 
-    lines += ["-" * 80, "TOP ACTIONABLE"]
+    lines += ["-" * 100, "TOP ACTIONABLE"]
     lines += [f" - {r['symbol']} a={r['alpha_score']:.1f} e={r['eligibility_score']:.1f}" for r in actionable] or [" - none"]
 
-    lines += ["-" * 80, "TOP REJECT REASONS (24h)"]
+    lines += ["-" * 100, "TOP REJECT REASONS (24h)"]
     lines += [f" - {r['reason']}: {r['c']}" for r in rejects] or [" - none"]
 
     if funnel and int(funnel["proposed_total"]) == 0:
-        lines += ["-" * 80, "ALERT: NO ACTIONABLE CANDIDATES", "Check funnel stage drops + source availability map."]
+        lines += ["-" * 100, "ALERT: NO ACTIONABLE CANDIDATES", "Check funnel stage drops + source availability map."]
 
     lines.append("\nRefreshes every 3s. Ctrl+C to exit.")
     return "\n".join(lines)
