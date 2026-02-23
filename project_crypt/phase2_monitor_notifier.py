@@ -134,7 +134,10 @@ def hourly_summary() -> str:
         # New funnel/ranked outputs retained
         cur.execute(
             """
-            select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,reasons_json,sources_present_json,ts
+            select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,
+                   reasons_json,sources_present_json,ts,
+                   watch_total,actionable_total,alpha_scored_total,cost_evaluated_total,risk_evaluated_total,
+                   rejects_tradable_json,rejects_external_json,sanity_json,regime,pressure_count
             from candidate_funnel_log
             where ts >= ?
             order by id desc
