@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 09:55 SGT
+Last updated: 2026-02-23 10:18 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -88,6 +88,22 @@ In the next session, load these for full context:
   - notional-aware liquidity coverage (`volume / target_notional`) contributes to eligibility scoring.
 - Extended alpha scoring with microstructure component (spread + mover membership + 24h move magnitude) and source-missing reweighting.
 - Result after fix: mapping stage recovered (mapped was stuck at 0; now significant mapped counts appear each cycle).
+
+### 9) Scored decision pipeline upgrade (non-binary cliff behavior)
+- Kept strict 3-state output every cycle per symbol (no silent drop):
+  - `WATCH`, `ELIGIBLE`, `ACTIONABLE`.
+- Added structured decision payload fields across state output/logs:
+  - `stage_reached`, `deny_reason`, `alpha_score`, `cost_edge_bps`, `uncertainty`, `risk_flags`.
+- Added explicit cost model function (`estimate_cost_bps`) with:
+  - half-spread,
+  - slippage proxy from liquidity coverage,
+  - volatility penalty.
+- Cost gate now uses edge accounting:
+  - `cost_edge_bps = expected_edge_bps - estimated_cost_bps - safety_margin_bps`.
+- Added separate stricter treatment for new listings in risk lane:
+  - higher safety margin,
+  - higher confidence requirement.
+- Added DEX boost top endpoint ingestion (`/token-boosts/top/v1`) to strengthen attention-shock proxy signal.
 
 ---
 

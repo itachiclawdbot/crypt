@@ -22,6 +22,7 @@ COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY")
 DEX_SCREENER_BASE_URL = os.getenv("DEX_SCREENER_BASE_URL", "https://api.dexscreener.com")
 DEX_LATEST_PROFILES_ENDPOINT = os.getenv("DEX_LATEST_PROFILES_ENDPOINT", "/token-profiles/latest/v1")
 DEX_BOOSTED_TOKENS_ENDPOINT = os.getenv("DEX_BOOSTED_TOKENS_ENDPOINT", "/token-boosts/latest/v1")
+DEX_BOOSTED_TOP_ENDPOINT = os.getenv("DEX_BOOSTED_TOP_ENDPOINT", "/token-boosts/top/v1")
 TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
 MIN_ACTIONABLE_SCORE = float(os.getenv("PHASE2_MIN_ACTIONABLE_SCORE", "70"))
 MIN_ELIGIBLE_SCORE = float(os.getenv("PHASE2_MIN_ELIGIBLE_SCORE", "45"))
@@ -342,6 +343,13 @@ def ingest_cmc() -> set[str]:
     return out
 
 
+def estimate_cost_bps(spread_bps: float, liquidity_cover: float, volatility_abs: float) -> float:
+    half_spread = max(0.0, spread_bps / 2.0)
+    slippage = max(2.0, 20.0 / max(1.0, liquidity_cover))
+    vol_penalty = min(15.0, max(0.0, volatility_abs * 100.0 * 0.3))
+    return half_spread + slippage + vol_penalty
+
+
 def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
     t0 = time.time()
     boosted: set[str] = set()
@@ -350,8 +358,10 @@ def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
     try:
         l = get_json(_norm_url(DEX_LATEST_PROFILES_ENDPOINT))
         b = get_json(_norm_url(DEX_BOOSTED_TOKENS_ENDPOINT))
+        bt = get_json(_norm_url(DEX_BOOSTED_TOP_ENDPOINT))
         l_rows = l if isinstance(l, list) else []
         b_rows = b if isinstance(b, list) else []
+        bt_rows = bt if isinstance(bt, list) else []
         for row in l_rows[:400]:
             sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
             if sym:
@@ -364,7 +374,12 @@ def ingest_dex() -> tuple[set[str], set[str], dict[str, dict]]:
             if sym:
                 boosted.add(sym)
                 put_signal(sym, Source.DEX, "boosted", {"entry": row}, conviction="high")
-        log_source_health(Source.DEX, "OK", int((time.time() - t0) * 1000), len(l_rows) + len(b_rows))
+        for row in bt_rows[:400]:
+            sym = str(row.get("tokenSymbol") or row.get("symbol") or "").upper()
+            if sym:
+                boosted.add(sym)
+                put_signal(sym, Source.DEX, "boosted_top", {"entry": row}, conviction="high")
+        log_source_health(Source.DEX, "OK", int((time.time() - t0) * 1000), len(l_rows) + len(b_rows) + len(bt_rows))
     except Exception as e:
         put_signal(None, Source.DEX, "ingest_error", {"error": str(e)})
         log_source_health(Source.DEX, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
@@ -615,14 +630,31 @@ def run_cycle() -> dict:
         )
 
         status = "WATCH"
+        stage_reached = "discovery"
+        risk_flags: list[str] = []
+        is_new_listing = sym in new_listings
+        if is_new_listing:
+            risk_flags.append("new_listing")
+        if spread_bps > dynamic_max_spread_bps:
+            risk_flags.append("wide_spread")
+        if liquidity_cover < 5:
+            risk_flags.append("thin_liquidity")
+
+        expected_edge_bps = alpha_score * 0.45
+        est_cost_bps = estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)))
+        safety_margin_bps = 12.0 if not is_new_listing else 20.0
+        cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
+
         if not mapped:
             deny_stage = "mapping"
+            stage_reached = "mapping"
             deny_reason = "not-tradable-on-crypto-com"
             reject_counter[deny_reason] += 1
             log_reject(sym, deny_stage, deny_reason, {"mapped": mapped})
-            status = "DENIED"
+            status = "WATCH"
         elif eligibility_score < MIN_ELIGIBLE_SCORE:
             deny_stage = "eligibility"
+            stage_reached = "eligibility"
             deny_reason = "eligibility-score-too-low"
             reject_counter[deny_reason] += 1
             log_reject(sym, deny_stage, deny_reason, {
@@ -636,43 +668,63 @@ def run_cycle() -> dict:
             status = "WATCH"
         else:
             eligible_count += 1
+            stage_reached = "eligibility"
+            status = "ELIGIBLE"
             if alpha_score < MIN_ACTIONABLE_SCORE:
                 deny_stage = "alpha"
+                stage_reached = "alpha"
                 deny_reason = "alpha-score-below-threshold"
                 reject_counter[deny_reason] += 1
                 log_reject(sym, deny_stage, deny_reason, {"alpha_score": alpha_score, "confidence": confidence})
-                status = "ELIGIBLE"
             else:
                 alpha_pass_count += 1
-                spread_cost_bps = 20.0 if sym in dex_boosted else 30.0
-                expected_edge_bps = alpha_score * 0.45
-                if expected_edge_bps - spread_cost_bps < 10.0:
+                stage_reached = "alpha"
+                if cost_edge_bps < 0:
                     deny_stage = "cost"
+                    stage_reached = "cost"
                     deny_reason = "net-edge-too-low"
                     reject_counter[deny_reason] += 1
-                    log_reject(sym, deny_stage, deny_reason, {"expected_edge_bps": expected_edge_bps, "spread_cost_bps": spread_cost_bps})
-                    status = "ELIGIBLE"
+                    log_reject(sym, deny_stage, deny_reason, {
+                        "expected_edge_bps": expected_edge_bps,
+                        "est_cost_bps": est_cost_bps,
+                        "safety_margin_bps": safety_margin_bps,
+                        "cost_edge_bps": cost_edge_bps,
+                    })
                 else:
                     cost_pass_count += 1
-                    risk_block = confidence < 0.55
+                    stage_reached = "cost"
+                    min_conf = 0.55 if not is_new_listing else 0.65
+                    risk_block = confidence < min_conf
                     if risk_block:
                         deny_stage = "risk"
+                        stage_reached = "risk"
                         deny_reason = "confidence-too-low"
                         reject_counter[deny_reason] += 1
-                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence})
-                        status = "ELIGIBLE"
+                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf})
                     else:
                         risk_pass_count += 1
                         proposed_count += 1
+                        stage_reached = "actionable"
                         status = "ACTIONABLE"
-                        put_signal(sym, Source.SYSTEM, "actionable_candidate", {"alpha_score": alpha_score, "confidence": confidence, "target_notional": TARGET_NOTIONAL_USDT}, conviction="high")
+                        put_signal(sym, Source.SYSTEM, "actionable_candidate", {
+                            "alpha_score": alpha_score,
+                            "confidence": confidence,
+                            "target_notional": TARGET_NOTIONAL_USDT,
+                            "cost_edge_bps": cost_edge_bps,
+                            "risk_flags": risk_flags,
+                            "new_listing": is_new_listing,
+                        }, conviction="high")
 
         item = {
             "symbol": sym,
             "status": status,
+            "stage_reached": stage_reached,
             "eligibility_score": round(eligibility_score, 2),
             "alpha_score": round(alpha_score, 2),
             "confidence": round(confidence, 3),
+            "uncertainty": round(1.0 - confidence, 3),
+            "cost_edge_bps": round(cost_edge_bps, 2),
+            "risk_flags": risk_flags,
             "mapped": mapped,
             "deny_stage": deny_stage,
             "deny_reason": deny_reason,
@@ -684,12 +736,18 @@ def run_cycle() -> dict:
             actionable_list.append(item)
 
         log_universe_state(sym, eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {
+            "stage_reached": stage_reached,
             "volume_24h": volume_24h,
             "spread_bps": spread_bps,
             "dynamic_min_volume": dynamic_min_volume,
             "dynamic_max_spread_bps": dynamic_max_spread_bps,
             "liquidity_cover": liquidity_cover,
-            "is_new_listing": sym in new_listings,
+            "is_new_listing": is_new_listing,
+            "expected_edge_bps": expected_edge_bps,
+            "est_cost_bps": est_cost_bps,
+            "cost_edge_bps": cost_edge_bps,
+            "uncertainty": (1.0 - confidence),
+            "risk_flags": risk_flags,
             **alpha_dbg,
         }, sources_present)
 
@@ -712,6 +770,9 @@ def run_cycle() -> dict:
 
     summary = {
         "discovered_total": len(discovered),
+        "watch_total": len([x for x in watchlist if x["status"] == "WATCH"]),
+        "eligible_state_total": len([x for x in watchlist if x["status"] == "ELIGIBLE"]),
+        "actionable_state_total": len([x for x in watchlist if x["status"] == "ACTIONABLE"]),
         "mapped_to_venue_total": mapped_count,
         "eligible_total": eligible_count,
         "alpha_pass_total": alpha_pass_count,
