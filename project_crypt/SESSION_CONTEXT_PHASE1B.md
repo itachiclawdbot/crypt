@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 15:03 SGT
+Last updated: 2026-02-23 15:44 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -285,3 +285,41 @@ After each material code or architecture update:
 1. Update this file (`SESSION_CONTEXT_PHASE1B.md`) summary sections.
 2. If architecture changed, also update `architecture/PHASE1B_ARCHITECTURE.md`.
 3. Commit docs updates together with code changes.
+
+---
+
+## 2026-02-23 second 4-issue pass (high-priority fixes)
+1) Micro join coverage uplift
+- microservice moved to interest-based stable universe management with hysteresis.
+- Added persistent universe state (`micro_universe_state.json`) with:
+  - `MICRO_MAX_REPLACEMENTS` (default 20)
+  - `MICRO_MIN_RESIDENCY_SEC` (default 1800)
+- Candidate symbols now come from active decision universe + top volume + pinned majors.
+- Coverage target increased beyond previous 80-book fixed approach.
+
+2) Pressure quality guardrail
+- pressure signal now requires:
+  - OBI threshold pass,
+  - `liquidity_score >= 10`,
+  - spread <= 80 bps.
+- Prevents OBI=1.0 thin-book artifacts from boosting alpha.
+
+3) Periodic analysis correctness
+- 6h periodic analysis switched to outcome-based rates from stage counters:
+  - mapping, eligibility, scored, cost_pass, risk_pass, actionable.
+- Bottleneck now reflects actual stage outcomes, not stale legacy alpha booleans.
+
+4) Cost lane realism for alts
+- Added spread-toxic bypass (`spread > 80bps`) into watch-like handling.
+- Added small-cap lane notional scaling (0.25x effective notional) for cost estimation.
+
+5) Reporting alignment updates
+- Watchlist rendered from `WATCH ∪ ELIGIBLE` ranked by alpha.
+- Decision-level rejects separated from event-level rejects.
+- Stage reach line + cliff hint retained.
+
+Runtime note:
+- Services restarted after this pass:
+  - `project_crypt.microstructure_service`
+  - `project_crypt.phase2_alpha_aggregator`
+  - `project_crypt.phase2_monitor_notifier`

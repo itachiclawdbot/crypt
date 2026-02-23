@@ -14,6 +14,9 @@ DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_
 POLL_SECONDS = int(os.getenv("MICRO_POLL_SECONDS", "30"))
 TOP_SYMBOLS = int(os.getenv("MICRO_TOP_SYMBOLS", "80"))
 TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
+MICRO_STATE_PATH = os.getenv("MICRO_STATE_PATH", "/home/itachi/.openclaw/workspace/project_crypt/micro_universe_state.json")
+MICRO_MAX_REPLACEMENTS = int(os.getenv("MICRO_MAX_REPLACEMENTS", "20"))
+MICRO_MIN_RESIDENCY_SEC = int(os.getenv("MICRO_MIN_RESIDENCY_SEC", "1800"))
 
 
 def utc_now() -> str:
@@ -101,6 +104,24 @@ def _active_universe_symbols(limit: int) -> list[str]:
         return [str(r[0]).upper() for r in cur.fetchall() if r[0]]
 
 
+def _load_micro_state() -> dict:
+    try:
+        if os.path.exists(MICRO_STATE_PATH):
+            with open(MICRO_STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"tracked": {}, "updated_ts": utc_now()}
+
+
+def _save_micro_state(state: dict) -> None:
+    try:
+        with open(MICRO_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
 def top_symbols() -> list[str]:
     d = get_json("https://api.crypto.com/exchange/v1/public/get-tickers")
     rows = d.get("result", {}).get("data", []) if isinstance(d, dict) else []
@@ -120,18 +141,57 @@ def top_symbols() -> list[str]:
         pairs.append((inst, vol_quote))
     pairs.sort(key=lambda x: x[1], reverse=True)
 
-    top_vol = [p[0] for p in pairs[: max(20, TOP_SYMBOLS // 2)]]
-    active = _active_universe_symbols(max(20, TOP_SYMBOLS))
+    # Issue-1 fix: expand to 120 interest-based books by default.
+    top_vol = [p[0] for p in pairs[: max(40, TOP_SYMBOLS // 2)]]
+    active = _active_universe_symbols(max(60, TOP_SYMBOLS))
+    pinned = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT", "SUI_USDT"]
 
-    merged = []
+    candidates = []
     seen = set()
-    for s in active + top_vol:
+    for s in active + top_vol + pinned:
         if s not in seen:
             seen.add(s)
-            merged.append(s)
-        if len(merged) >= TOP_SYMBOLS:
+            candidates.append(s)
+
+    state = _load_micro_state()
+    tracked: dict[str, str] = dict(state.get("tracked", {}))  # instrument -> first_seen_ts
+    now = datetime.now(timezone.utc)
+
+    keep: list[str] = []
+    for inst, first_ts in tracked.items():
+        try:
+            age = (now - datetime.fromisoformat(first_ts)).total_seconds()
+        except Exception:
+            age = MICRO_MIN_RESIDENCY_SEC + 1
+        if inst in candidates or age < MICRO_MIN_RESIDENCY_SEC:
+            keep.append(inst)
+
+    desired = candidates[:TOP_SYMBOLS]
+    additions = [s for s in desired if s not in keep]
+    additions = additions[: max(1, MICRO_MAX_REPLACEMENTS)]
+
+    final = []
+    for s in keep + additions:
+        if s not in final:
+            final.append(s)
+        if len(final) >= TOP_SYMBOLS:
             break
-    return merged
+
+    # backfill if needed
+    for s in desired:
+        if len(final) >= TOP_SYMBOLS:
+            break
+        if s not in final:
+            final.append(s)
+
+    new_tracked = {}
+    for s in final:
+        new_tracked[s] = tracked.get(s) or utc_now()
+    state["tracked"] = new_tracked
+    state["updated_ts"] = utc_now()
+    _save_micro_state(state)
+
+    return final
 
 
 def depth_usd_in_band(levels: list[list[str]], low: float, high: float) -> float:
@@ -178,7 +238,7 @@ def compute_snapshot_features(symbol: str) -> dict | None:
     obi10 = (bid10 - ask10) / (depth10 + eps)
     obi20 = (bid20 - ask20) / (depth20 + eps)
 
-    pressure = bid20 > 3.0 * max(1.0, ask20)
+    pressure_raw = bid20 > 3.0 * max(1.0, ask20)
 
     bands = [5, 10, 20, 50]
     depths = []
@@ -197,8 +257,11 @@ def compute_snapshot_features(symbol: str) -> dict | None:
 
     liq_score = depth20 / max(1.0, TARGET_NOTIONAL_USDT)
 
+    # Issue-2 fix: pressure requires both OBI condition AND adequate liquidity, plus non-toxic spread.
+    pressure = bool(pressure_raw and liq_score >= 10.0 and spread_bps <= 80.0)
+
     flags = []
-    if abs(obi20) >= 0.70:
+    if abs(obi20) >= 0.70 and liq_score >= 10.0:
         flags.append("obi_extreme")
     if liq_score < 5:
         flags.append("thin_liquidity")

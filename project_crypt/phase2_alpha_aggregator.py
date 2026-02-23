@@ -1075,7 +1075,7 @@ def run_cycle() -> dict:
         )
         alpha_scored_count += 1
         obi20 = abs(float(micro.get("obi_20bps", 0.0)))
-        pressure_flag = obi20 >= obi_threshold
+        pressure_flag = (obi20 >= obi_threshold) and (liquidity_cover >= 10.0) and (spread_bps <= 80.0)
         if pressure_flag:
             pressure_count += 1
             alpha_score += 8.0
@@ -1096,15 +1096,27 @@ def run_cycle() -> dict:
             risk_flags.append("thin_liquidity")
 
         expected_edge_bps = alpha_score * 0.45
-        est_cost_bps = estimate_cost_bps(
-            spread_bps,
-            liquidity_cover,
-            float(venue.get("chg_24h_abs", 0.0)),
-            depth_usd_20bps=depth_20bps,
-        )
-        cost_evaluated_count += 1
+
+        # Issue-4: small-cap lane + spread-toxic bypass.
+        spread_toxic = spread_bps > 80.0
+        small_cap_lane = liquidity_cover < 20.0
+        effective_notional = TARGET_NOTIONAL_USDT * (0.25 if small_cap_lane else 1.0)
+        effective_liq_cover = max(0.01, depth_20bps / max(1.0, effective_notional)) if depth_20bps > 0 else liquidity_cover
+
         safety_margin_bps = 12.0 if not is_new_listing else 20.0
-        cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
+        if spread_toxic:
+            est_cost_bps = 9999.0
+            cost_edge_bps = -9999.0
+        else:
+            est_cost_bps = estimate_cost_bps(
+                spread_bps,
+                effective_liq_cover,
+                float(venue.get("chg_24h_abs", 0.0)),
+                depth_usd_20bps=depth_20bps,
+            )
+            cost_evaluated_count += 1
+            safety_margin_bps = 12.0 if not is_new_listing else 20.0
+            cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
 
         if sym in front_run_symbols and mapped:
             status = "ACTIONABLE"
@@ -1167,7 +1179,19 @@ def run_cycle() -> dict:
             else:
                 alpha_pass_count += 1
                 stage_reached = "alpha"
-                if cost_edge_bps < 0:
+                if spread_toxic:
+                    deny_stage = "cost"
+                    stage_reached = "cost"
+                    deny_reason = "watch-spread-toxic"
+                    reject_counter[deny_reason] += 1
+                    rejects_tradable["cost"] += 1
+                    status = "WATCH"
+                    log_reject(sym, deny_stage, deny_reason, {
+                        "spread_bps": spread_bps,
+                        "spread_limit_bps": 80.0,
+                        "bypass_cost_eval": True,
+                    })
+                elif cost_edge_bps < 0:
                     deny_stage = "cost"
                     stage_reached = "cost"
                     deny_reason = "net-edge-too-low"
@@ -1178,6 +1202,7 @@ def run_cycle() -> dict:
                         "est_cost_bps": est_cost_bps,
                         "safety_margin_bps": safety_margin_bps,
                         "cost_edge_bps": cost_edge_bps,
+                        "effective_notional": effective_notional,
                     })
                 else:
                     cost_pass_count += 1

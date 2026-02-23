@@ -25,7 +25,7 @@ def _safe_ratio(num: float, den: float) -> float:
 def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
     cur.execute(
         """
-        select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total
+        select discovered_total,mapped_to_venue_total,eligible_total,actionable_total,alpha_scored_total,cost_evaluated_total,cost_pass_total,risk_evaluated_total,risk_pass_total
         from candidate_funnel_log
         where ts >= ?
         order by id desc
@@ -37,43 +37,45 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
     if not rows:
         return "none", "no-funnel-data"
 
-    discovered = sum(int(r["discovered_total"]) for r in rows)
-    mapped = sum(int(r["mapped_to_venue_total"]) for r in rows)
-    eligible = sum(int(r["eligible_total"]) for r in rows)
-    alpha = sum(int(r["alpha_pass_total"]) for r in rows)
-    risk = sum(int(r["risk_pass_total"]) for r in rows)
-    cost = sum(int(r["cost_pass_total"]) for r in rows)
-    proposed = sum(int(r["proposed_total"]) for r in rows)
+    discovered = sum(int(r["discovered_total"] or 0) for r in rows)
+    mapped = sum(int(r["mapped_to_venue_total"] or 0) for r in rows)
+    eligible = sum(int(r["eligible_total"] or 0) for r in rows)
+    actionable = sum(int(r["actionable_total"] or 0) for r in rows)
+    scored = sum(int(r["alpha_scored_total"] or 0) for r in rows)
+    costed = sum(int(r["cost_evaluated_total"] or 0) for r in rows)
+    cost_pass = sum(int(r["cost_pass_total"] or 0) for r in rows)
+    risked = sum(int(r["risk_evaluated_total"] or 0) for r in rows)
+    risk_pass = sum(int(r["risk_pass_total"] or 0) for r in rows)
 
     mapping_rate = _safe_ratio(mapped, discovered)
     eligible_rate = _safe_ratio(eligible, mapped)
-    alpha_rate = _safe_ratio(alpha, eligible)
-    risk_rate = _safe_ratio(risk, alpha)
-    cost_rate = _safe_ratio(cost, risk)
-    proposed_rate = _safe_ratio(proposed, cost)
+    scored_rate = _safe_ratio(scored, eligible)
+    cost_pass_rate = _safe_ratio(cost_pass, costed)
+    risk_pass_rate = _safe_ratio(risk_pass, risked)
+    actionable_rate = _safe_ratio(actionable, scored)
 
     stage_rates = {
         "mapping": mapping_rate,
         "eligibility": eligible_rate,
-        "alpha": alpha_rate,
-        "risk": risk_rate,
-        "cost": cost_rate,
-        "proposal": proposed_rate,
+        "scored": scored_rate,
+        "cost": cost_pass_rate,
+        "risk": risk_pass_rate,
+        "actionable": actionable_rate,
     }
     bottleneck_stage = min(stage_rates, key=stage_rates.get)
 
     recommendation = {
         "mapping": "Expand symbol mapping aliases and venue-availability map first.",
         "eligibility": "Tune liquidity gates using percentile thresholds tied to target notional.",
-        "alpha": "Rebalance alpha weights / lower hard alpha cutoff slightly when social is missing.",
+        "scored": "Improve feature join coverage + alpha differentiation on alts.",
+        "cost": "Adjust cost model and spread toxic filters / small-cap notional lane.",
         "risk": "Inspect confidence calibration and cooldown logic for excessive denials.",
-        "cost": "Adjust min net-edge gate or improve spread/slippage estimation.",
-        "proposal": "Inspect final proposal constraints (drift/notional/cooldown) for over-filtering.",
+        "actionable": "Inspect final proposal constraints for over-filtering.",
     }[bottleneck_stage]
 
     analysis_txt = (
-        f"6h_rates mapping={mapping_rate:.2f} elig={eligible_rate:.2f} alpha={alpha_rate:.2f} "
-        f"risk={risk_rate:.2f} cost={cost_rate:.2f} proposal={proposed_rate:.2f}; bottleneck={bottleneck_stage}"
+        f"6h_rates mapping={mapping_rate:.2f} elig={eligible_rate:.2f} scored={scored_rate:.2f} "
+        f"cost_pass={cost_pass_rate:.2f} risk_pass={risk_pass_rate:.2f} actionable={actionable_rate:.2f}; bottleneck={bottleneck_stage}"
     )
     return analysis_txt, recommendation
 
