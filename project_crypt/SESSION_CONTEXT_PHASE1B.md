@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 08:50 SGT
+Last updated: 2026-02-23 09:55 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -70,6 +70,24 @@ In the next session, load these for full context:
   - full decision cycle every 300s (default).
 - Added startup Telegram ping after first successful cycle with funnel snapshot and top candidates.
 - Added kill-switch runtime visibility + critical alert behavior in aggregator/dashboard status.
+
+### 8) Venue-native universe + adaptive eligibility + schema-drift hardening
+- Fixed Crypto.com instrument parsing bug due to API schema drift:
+  - old expected: `result.instruments` + `instrument_name`
+  - current actual: `result.data` + `symbol/base_ccy/quote_ccy`
+- Added venue-native discovery stream from Crypto.com tickers:
+  - top-volume symbols,
+  - top %-move symbols,
+  - spread-event symbols.
+- Added new-listing detection by diffing current Crypto.com base universe vs persisted prior snapshot (`phase2_listing_state.json`).
+- Discovery universe now merges external + venue-native sources:
+  - CoinGecko/CMC/DEX + Crypto.com movers + new listings.
+- Added adaptive eligibility thresholds:
+  - `min_volume_24h = max(100k, P25 venue volume)`
+  - `max_spread_bps = min(50, P75 venue spread)`
+  - notional-aware liquidity coverage (`volume / target_notional`) contributes to eligibility scoring.
+- Extended alpha scoring with microstructure component (spread + mover membership + 24h move magnitude) and source-missing reweighting.
+- Result after fix: mapping stage recovered (mapped was stuck at 0; now significant mapped counts appear each cycle).
 
 ---
 

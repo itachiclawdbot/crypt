@@ -28,6 +28,7 @@ MIN_ELIGIBLE_SCORE = float(os.getenv("PHASE2_MIN_ELIGIBLE_SCORE", "45"))
 DISCOVERY_TICK_SECONDS = int(os.getenv("PHASE2_DISCOVERY_TICK_SECONDS", "120"))
 MARKET_TICK_SECONDS = int(os.getenv("PHASE2_MARKET_TICK_SECONDS", "60"))
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", "/var/run/cryptobot/STOP")
+LISTING_STATE_PATH = os.getenv("PHASE2_LISTING_STATE_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_listing_state.json")
 
 
 class Source:
@@ -213,6 +214,92 @@ def ingest_cryptocom() -> set[str]:
     return symbols
 
 
+def _percentile(values: list[float], p: float, fallback: float) -> float:
+    clean = sorted(v for v in values if isinstance(v, (int, float)))
+    if not clean:
+        return fallback
+    idx = int((len(clean) - 1) * max(0.0, min(1.0, p)))
+    return float(clean[idx])
+
+
+def ingest_cryptocom_movers() -> tuple[set[str], dict[str, dict]]:
+    """Venue-native discovery (top volume / movers / spread events).
+
+    Returns mover symbols and per-symbol microstructure-like metrics from ticker stream.
+    """
+    t0 = time.time()
+    movers: set[str] = set()
+    metrics: dict[str, dict] = {}
+    try:
+        data = get_json("https://api.crypto.com/exchange/v1/public/get-tickers")
+        rows = data.get("result", {}).get("data", []) if isinstance(data, dict) else []
+
+        ranked = []
+        for r in rows:
+            inst = str(r.get("i", "")).upper()  # e.g. BTC_USDT / BTC_USD
+            if "_" not in inst:
+                continue
+            base, quote = inst.split("_", 1)
+            if quote not in {"USD", "USDT"}:
+                continue
+
+            vol_quote = float(r.get("vv") or 0.0)
+            chg_24h = abs(float(r.get("c") or 0.0))
+            bid = float(r.get("b") or 0.0)
+            ask = float(r.get("k") or 0.0)
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+            spread_bps = ((ask - bid) / mid * 10000.0) if mid > 0 else 9999.0
+
+            ranked.append((base, vol_quote, chg_24h, spread_bps))
+            metrics[base] = {
+                "volume_24h_quote": vol_quote,
+                "chg_24h_abs": chg_24h,
+                "spread_bps": spread_bps,
+            }
+
+        ranked_by_vol = sorted(ranked, key=lambda x: x[1], reverse=True)[:80]
+        ranked_by_move = sorted(ranked, key=lambda x: x[2], reverse=True)[:80]
+        spread_events = [x for x in ranked if x[3] <= 50.0][:80]
+
+        for base, *_ in ranked_by_vol + ranked_by_move + spread_events:
+            movers.add(base)
+
+        put_signal(None, Source.CRYPTOCOM, "venue_movers_snapshot", {
+            "rows": len(rows),
+            "movers": len(movers),
+            "top_volume": [x[0] for x in ranked_by_vol[:10]],
+            "top_move": [x[0] for x in ranked_by_move[:10]],
+        })
+        log_source_health(Source.CRYPTOCOM, "OK", int((time.time() - t0) * 1000), len(rows))
+    except Exception as e:
+        put_signal(None, Source.CRYPTOCOM, "venue_movers_error", {"error": str(e)})
+        log_source_health(Source.CRYPTOCOM, "DEGRADED", int((time.time() - t0) * 1000), 0, str(e))
+
+    return movers, metrics
+
+
+def detect_new_listings(current_symbols: set[str]) -> set[str]:
+    prev: set[str] = set()
+    try:
+        if os.path.exists(LISTING_STATE_PATH):
+            prev = set(json.loads(open(LISTING_STATE_PATH, "r", encoding="utf-8").read()).get("symbols", []))
+    except Exception:
+        prev = set()
+
+    new_symbols = set(current_symbols) - prev if prev else set()
+    if new_symbols:
+        for sym in sorted(new_symbols)[:100]:
+            put_signal(sym, Source.CRYPTOCOM, "new_listing", {"symbol": sym}, conviction="watch")
+
+    try:
+        with open(LISTING_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ts": utc_now(), "symbols": sorted(list(current_symbols))}, f)
+    except Exception:
+        pass
+
+    return new_symbols
+
+
 def ingest_coingecko() -> set[str]:
     t0 = time.time()
     out: set[str] = set()
@@ -303,7 +390,7 @@ def ingest_news() -> int:
     return total_hits
 
 
-def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int) -> dict:
+def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_hits: int, venue_movers: set[str]) -> dict:
     x_on = bool(os.getenv("X_BEARER_TOKEN") or os.getenv("X_API_KEY"))
     reddit_on = bool(os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET"))
     return {
@@ -312,23 +399,26 @@ def source_availability(cg: set[str], cmc: set[str], dex_latest: set[str], news_
         Source.DEX: len(dex_latest) > 0,
         Source.CRYPTOPANIC: news_hits >= 0,
         Source.FREE_NEWS: news_hits >= 0,
+        "venue_movers": len(venue_movers) > 0,
         Source.X: x_on,
         Source.REDDIT: reddit_on,
     }
 
 
-def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str], dex_boosted: set[str], mapped: bool, sources_present: dict) -> tuple[float, float, dict]:
+def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str], dex_boosted: set[str], venue_movers: set[str], mapped: bool, sources_present: dict, venue_metrics: dict[str, dict]) -> tuple[float, float, dict]:
     base_weights = {
-        "market": 35.0,
+        "market": 30.0,
         "liquidity": 25.0,
-        "news": 20.0,
-        "social": 20.0,
+        "microstructure": 25.0,
+        "news": 10.0,
+        "social": 10.0,
     }
     social_available = sources_present.get(Source.X) or sources_present.get(Source.REDDIT)
     if not social_available:
-        base_weights["news"] += 10.0
-        base_weights["market"] += 10.0
         base_weights["social"] = 0.0
+        base_weights["market"] += 5.0
+        base_weights["microstructure"] += 10.0
+        base_weights["news"] += 5.0
 
     score = 0.0
     market_points = 0.0
@@ -342,8 +432,21 @@ def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str
     liquidity_points += 15.0 if symbol in dex_boosted else 0.0
     score += min(base_weights["liquidity"], liquidity_points)
 
-    news_points = 8.0 if symbol in cg else 0.0
-    news_points += 12.0 if symbol in dex_boosted else 0.0
+    vm = venue_metrics.get(symbol, {})
+    micro_points = 0.0
+    if symbol in venue_movers:
+        micro_points += 12.0
+    spread_bps = float(vm.get("spread_bps", 9999.0))
+    if spread_bps <= 50:
+        micro_points += 8.0
+    if spread_bps <= 20:
+        micro_points += 5.0
+    if float(vm.get("chg_24h_abs", 0.0)) >= 0.03:
+        micro_points += 5.0
+    score += min(base_weights["microstructure"], micro_points)
+
+    news_points = 4.0 if symbol in cg else 0.0
+    news_points += 6.0 if symbol in dex_boosted else 0.0
     score += min(base_weights["news"], news_points)
 
     social_points = 0.0
@@ -356,7 +459,15 @@ def weighted_alpha(symbol: str, cg: set[str], cmc: set[str], dex_latest: set[str
     if not mapped:
         confidence *= 0.7
 
-    return score, confidence, {"weights": base_weights, "market_points": market_points, "liquidity_points": liquidity_points, "news_points": news_points, "social_points": social_points}
+    return score, confidence, {
+        "weights": base_weights,
+        "market_points": market_points,
+        "liquidity_points": liquidity_points,
+        "micro_points": micro_points,
+        "news_points": news_points,
+        "social_points": social_points,
+        "spread_bps": spread_bps,
+    }
 
 
 def log_reject(symbol: str, stage: str, reason: str, metrics: dict) -> None:
@@ -438,6 +549,10 @@ def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_cryptocom"})
     crypto_symbols = ingest_cryptocom()
 
+    write_status({"state": "running", "job": "ingest_cryptocom_movers"})
+    venue_movers, venue_metrics = ingest_cryptocom_movers()
+    new_listings = detect_new_listings(crypto_symbols)
+
     write_status({"state": "running", "job": "ingest_coingecko"})
     cg = ingest_coingecko()
 
@@ -450,8 +565,8 @@ def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_news"})
     news_hits = ingest_news()
 
-    sources_present = source_availability(cg, cmc, dex_latest, news_hits)
-    discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted))
+    sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers)
+    discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings))
 
     mapped_count = 0
     eligible_count = 0
@@ -465,26 +580,39 @@ def run_cycle() -> dict:
     eligible_list: list[dict] = []
     actionable_list: list[dict] = []
 
-    dynamic_min_volume = 100000.0
+    venue_vols = [float(v.get("volume_24h_quote", 0.0)) for v in venue_metrics.values()]
+    venue_spreads = [float(v.get("spread_bps", 9999.0)) for v in venue_metrics.values()]
+    dynamic_min_volume = max(100000.0, _percentile(venue_vols, 0.25, 100000.0))
+    dynamic_max_spread_bps = min(50.0, _percentile(venue_spreads, 0.75, 50.0))
 
     for sym in discovered:
         mapped = sym in crypto_symbols
         if mapped:
             mapped_count += 1
 
-        volume_24h = float(dex_metrics.get(sym, {}).get("volume24h", 0.0))
+        venue = venue_metrics.get(sym, {})
+        volume_24h = float(venue.get("volume_24h_quote", dex_metrics.get(sym, {}).get("volume24h", 0.0)))
+        spread_bps = float(venue.get("spread_bps", 9999.0))
+        liquidity_cover = (volume_24h / max(1.0, TARGET_NOTIONAL_USDT))
+
         eligibility_score = 0.0
         deny_stage = None
         deny_reason = None
 
         if mapped:
-            eligibility_score += 40
+            eligibility_score += 30
         if volume_24h >= dynamic_min_volume:
-            eligibility_score += 35
-        if sym in dex_latest:
-            eligibility_score += 25
+            eligibility_score += 30
+        if spread_bps <= dynamic_max_spread_bps:
+            eligibility_score += 20
+        if liquidity_cover >= 10:
+            eligibility_score += 20
+        elif liquidity_cover >= 5:
+            eligibility_score += 10
 
-        alpha_score, confidence, alpha_dbg = weighted_alpha(sym, cg, cmc, dex_latest, dex_boosted, mapped, sources_present)
+        alpha_score, confidence, alpha_dbg = weighted_alpha(
+            sym, cg, cmc, dex_latest, dex_boosted, venue_movers, mapped, sources_present, venue_metrics
+        )
 
         status = "WATCH"
         if not mapped:
@@ -497,7 +625,14 @@ def run_cycle() -> dict:
             deny_stage = "eligibility"
             deny_reason = "eligibility-score-too-low"
             reject_counter[deny_reason] += 1
-            log_reject(sym, deny_stage, deny_reason, {"eligibility_score": eligibility_score, "volume_24h": volume_24h})
+            log_reject(sym, deny_stage, deny_reason, {
+                "eligibility_score": eligibility_score,
+                "volume_24h": volume_24h,
+                "spread_bps": spread_bps,
+                "dynamic_min_volume": dynamic_min_volume,
+                "dynamic_max_spread_bps": dynamic_max_spread_bps,
+                "liquidity_cover": liquidity_cover,
+            })
             status = "WATCH"
         else:
             eligible_count += 1
@@ -548,7 +683,15 @@ def run_cycle() -> dict:
         if status == "ACTIONABLE":
             actionable_list.append(item)
 
-        log_universe_state(sym, eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {"volume_24h": volume_24h, **alpha_dbg}, sources_present)
+        log_universe_state(sym, eligibility_score, alpha_score, confidence, status, deny_stage, deny_reason, {
+            "volume_24h": volume_24h,
+            "spread_bps": spread_bps,
+            "dynamic_min_volume": dynamic_min_volume,
+            "dynamic_max_spread_bps": dynamic_max_spread_bps,
+            "liquidity_cover": liquidity_cover,
+            "is_new_listing": sym in new_listings,
+            **alpha_dbg,
+        }, sources_present)
 
     top_reasons = reject_counter.most_common(8)
     log_funnel(
@@ -577,6 +720,13 @@ def run_cycle() -> dict:
         "proposed_total": proposed_count,
         "top_reject_reasons": top_reasons,
         "sources_present": sources_present,
+        "venue_movers_total": len(venue_movers),
+        "new_listings_total": len(new_listings),
+        "adaptive_thresholds": {
+            "min_volume_24h": round(dynamic_min_volume, 2),
+            "max_spread_bps": round(dynamic_max_spread_bps, 2),
+            "target_notional": TARGET_NOTIONAL_USDT,
+        },
         "watchlist_top": watch_top,
         "eligible_top": eligible_top,
         "actionable_top": actionable_top,
