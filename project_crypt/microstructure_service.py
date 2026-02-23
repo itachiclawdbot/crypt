@@ -12,7 +12,7 @@ import requests
 
 DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3")
 POLL_SECONDS = int(os.getenv("MICRO_POLL_SECONDS", "30"))
-TOP_SYMBOLS = int(os.getenv("MICRO_TOP_SYMBOLS", "80"))
+TOP_SYMBOLS = int(os.getenv("MICRO_TOP_SYMBOLS", "150"))
 TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
 MICRO_STATE_PATH = os.getenv("MICRO_STATE_PATH", "/home/itachi/.openclaw/workspace/project_crypt/micro_universe_state.json")
 MICRO_MAX_REPLACEMENTS = int(os.getenv("MICRO_MAX_REPLACEMENTS", "20"))
@@ -274,8 +274,11 @@ def compute_snapshot_features(symbol: str) -> dict | None:
         "spread_bps": spread_bps,
         "depth_usd_10bps": depth10,
         "depth_usd_20bps": depth20,
+        "bid_depth_usd_20bps": bid20,
+        "ask_depth_usd_20bps": ask20,
         "obi_10bps": obi10,
         "obi_20bps": obi20,
+        "pressure_raw": pressure_raw,
         "pressure_flag": pressure,
         "orderbook_slope": slope,
         "liquidity_score": liq_score,
@@ -379,16 +382,65 @@ def main() -> None:
     init_tables()
     while True:
         try:
+            state = _load_micro_state()
+            pressure_meta: dict = dict(state.get("pressure_meta", {}))
             syms = top_symbols()
+            now_iso = utc_now()
+            now_dt = datetime.fromisoformat(now_iso)
+
             for s in syms:
                 try:
                     f = compute_snapshot_features(s)
                     if not f:
                         continue
+
+                    # Issue-4 fix: require pressure persistence (>=2 consecutive updates OR >=30s)
+                    # and guard against near-zero ask depth artifacts for extreme OBI cases.
+                    meta = pressure_meta.get(s, {})
+                    prev_count = int(meta.get("count", 0))
+                    prev_first = meta.get("first_ts")
+                    try:
+                        prev_first_dt = datetime.fromisoformat(prev_first) if prev_first else now_dt
+                    except Exception:
+                        prev_first_dt = now_dt
+
+                    extreme_obi = abs(float(f.get("obi_20bps", 0.0))) > 0.9
+                    ask20 = float(f.get("ask_depth_usd_20bps", 0.0))
+                    bid20 = float(f.get("bid_depth_usd_20bps", 0.0))
+                    artifact = bool(extreme_obi and ask20 < max(50.0, 0.05 * max(1.0, bid20)))
+
+                    if bool(f.get("pressure_flag")) and (not artifact):
+                        count = prev_count + 1
+                        first_ts = prev_first or now_iso
+                    else:
+                        count = 0
+                        first_ts = None
+
+                    held_secs = (now_dt - prev_first_dt).total_seconds() if prev_first else 0.0
+                    persisted = bool((count >= 2) or (held_secs >= 30.0))
+                    f["pressure_flag"] = bool(f.get("pressure_flag") and persisted and (not artifact))
+                    f["pressure_persistence_count"] = count
+                    f["pressure_held_seconds"] = round(held_secs, 2)
+                    f["obi_artifact_guard"] = artifact
+
+                    if extreme_obi:
+                        f.setdefault("risk_flags", []).append("obi_extreme_debug")
+                        f["obi_debug"] = {
+                            "bid_depth_usd_20bps": bid20,
+                            "ask_depth_usd_20bps": ask20,
+                            "artifact": artifact,
+                        }
+
+                    pressure_meta[s] = {"count": count, "first_ts": first_ts}
+
                     f = enrich_rolling(f)
                     persist_feature(f)
                 except Exception:
                     continue
+
+            state["pressure_meta"] = pressure_meta
+            state["updated_ts"] = utc_now()
+            _save_micro_state(state)
         except Exception:
             pass
         time.sleep(max(10, POLL_SECONDS))

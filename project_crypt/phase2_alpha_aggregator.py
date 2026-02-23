@@ -893,6 +893,35 @@ def emit_listing_front_run(new_listings: set[str]) -> set[str]:
     return triggered
 
 
+def tradable_autotuner_stats(hours: int = 24) -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    out = {"ghost_runs": 0, "avg_net_pnl_bps": 0.0, "by_reject_reason": {}}
+    with db() as c:
+        cur = c.cursor()
+        cur.execute(
+            """
+            select reject_reason, count(*) c, avg(net_pnl_bps) a
+            from ghost_sim_runs
+            where ts>=? and instrument_symbol like '%_%'
+            group by reject_reason
+            """,
+            (since,),
+        )
+        rows = cur.fetchall()
+        total = 0
+        weighted = 0.0
+        for r in rows:
+            rr = str(r[0] or "unknown")
+            ccount = int(r[1] or 0)
+            avg = float(r[2] or 0.0)
+            out["by_reject_reason"][rr] = {"count": ccount, "avg_net_pnl_bps": round(avg, 2)}
+            total += ccount
+            weighted += avg * ccount
+        out["ghost_runs"] = total
+        out["avg_net_pnl_bps"] = round(weighted / total, 2) if total else 0.0
+    return out
+
+
 def run_ghost_simulator() -> dict:
     since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     rows_done = 0
@@ -994,6 +1023,7 @@ def run_cycle() -> dict:
     risk_evaluated_count = 0
     invalid_assets_filtered = 0
     alpha_floor_override_count = 0
+    cost_fail_breakdown: Counter = Counter()
 
     venue_vols = [float(v.get("volume_24h_quote", 0.0)) for v in venue_metrics.values()]
     venue_spreads = [float(v.get("spread_bps", 9999.0)) for v in venue_metrics.values()]
@@ -1104,18 +1134,19 @@ def run_cycle() -> dict:
         effective_liq_cover = max(0.01, depth_20bps / max(1.0, effective_notional)) if depth_20bps > 0 else liquidity_cover
 
         safety_margin_bps = 12.0 if not is_new_listing else 20.0
+        half_spread_bps = max(0.0, spread_bps / 2.0)
+        depth = max(1.0, float(depth_20bps or 0.0))
+        slippage_depth_bps = (effective_notional / depth) * 10000.0 * 0.08
+        slippage_proxy_bps = max(2.0, 20.0 / max(1.0, effective_liq_cover))
+        slippage_bps = max(slippage_proxy_bps, slippage_depth_bps)
+        vol_penalty_bps = min(15.0, max(0.0, float(venue.get("chg_24h_abs", 0.0)) * 100.0 * 0.3))
+
         if spread_toxic:
             est_cost_bps = 9999.0
             cost_edge_bps = -9999.0
         else:
-            est_cost_bps = estimate_cost_bps(
-                spread_bps,
-                effective_liq_cover,
-                float(venue.get("chg_24h_abs", 0.0)),
-                depth_usd_20bps=depth_20bps,
-            )
+            est_cost_bps = half_spread_bps + slippage_bps + vol_penalty_bps
             cost_evaluated_count += 1
-            safety_margin_bps = 12.0 if not is_new_listing else 20.0
             cost_edge_bps = expected_edge_bps - est_cost_bps - safety_margin_bps
 
         if sym in front_run_symbols and mapped:
@@ -1185,11 +1216,14 @@ def run_cycle() -> dict:
                     deny_reason = "watch-spread-toxic"
                     reject_counter[deny_reason] += 1
                     rejects_tradable["cost"] += 1
+                    cost_fail_breakdown["spread_cost_dominant"] += 1
                     status = "WATCH"
                     log_reject(sym, deny_stage, deny_reason, {
                         "spread_bps": spread_bps,
                         "spread_limit_bps": 80.0,
                         "bypass_cost_eval": True,
+                        "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+                        "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
                     })
                 elif cost_edge_bps < 0:
                     deny_stage = "cost"
@@ -1197,12 +1231,26 @@ def run_cycle() -> dict:
                     deny_reason = "net-edge-too-low"
                     reject_counter[deny_reason] += 1
                     rejects_tradable["cost"] += 1
+                    dominant = max(
+                        [("spread_cost_dominant", half_spread_bps), ("slippage_dominant", slippage_bps), ("vol_penalty_dominant", vol_penalty_bps), ("safety_margin_dominant", safety_margin_bps)],
+                        key=lambda x: x[1],
+                    )[0]
+                    cost_fail_breakdown[dominant] += 1
                     log_reject(sym, deny_stage, deny_reason, {
                         "expected_edge_bps": expected_edge_bps,
                         "est_cost_bps": est_cost_bps,
                         "safety_margin_bps": safety_margin_bps,
                         "cost_edge_bps": cost_edge_bps,
                         "effective_notional": effective_notional,
+                        "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+                        "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+                        "cost_components": {
+                            "spread": half_spread_bps,
+                            "slippage": slippage_bps,
+                            "vol_penalty": vol_penalty_bps,
+                            "safety_margin": safety_margin_bps,
+                            "dominant": dominant,
+                        },
                     })
                 else:
                     cost_pass_count += 1
@@ -1271,6 +1319,8 @@ def run_cycle() -> dict:
             "is_new_listing": is_new_listing,
             "expected_edge_bps": expected_edge_bps,
             "est_cost_bps": est_cost_bps,
+            "est_cost_bps_full_size": estimate_cost_bps(spread_bps, liquidity_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
+            "est_cost_bps_smallcap_lane": estimate_cost_bps(spread_bps, effective_liq_cover, float(venue.get("chg_24h_abs", 0.0)), depth_usd_20bps=depth_20bps),
             "cost_edge_bps": cost_edge_bps,
             "uncertainty": (1.0 - confidence),
             "risk_flags": risk_flags,
@@ -1278,6 +1328,7 @@ def run_cycle() -> dict:
         }, sources_present)
 
     top_reasons = reject_counter.most_common(8)
+    autotuner_stats = tradable_autotuner_stats(24)
 
     # dedupe by instrument_symbol
     deduped: dict[str, dict] = {}
@@ -1343,6 +1394,8 @@ def run_cycle() -> dict:
             "rejects_external": dict(rejects_external),
             "sanity": sanity,
             "regime": regime,
+            "cost_fail_breakdown": dict(cost_fail_breakdown),
+            "autotuner_tradable": autotuner_stats,
             "pressure_count": pressure_count,
         },
     )
@@ -1379,6 +1432,8 @@ def run_cycle() -> dict:
         "regime": regime,
         "pressure_count": pressure_count,
         "sanity": sanity,
+        "cost_fail_breakdown": dict(cost_fail_breakdown),
+        "autotuner_tradable": autotuner_stats,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
         "defillama_symbols_total": len(llama_syms),

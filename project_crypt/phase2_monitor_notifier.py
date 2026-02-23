@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
@@ -227,6 +228,31 @@ def hourly_summary() -> str:
         )
         best_liq = cur.fetchall()
 
+        cur.execute(
+            """
+            select metrics_json
+            from candidate_reject_log
+            where ts >= ? and reason in ('net-edge-too-low','watch-spread-toxic')
+            order by id desc
+            limit 300
+            """,
+            (since,),
+        )
+        cost_metrics = cur.fetchall()
+
+        cur.execute(
+            """
+            select reject_reason, count(*) c, avg(net_pnl_bps) a
+            from ghost_sim_runs
+            where ts >= ? and instrument_symbol like '%_%'
+            group by reject_reason
+            order by c desc
+            limit 5
+            """,
+            (since_6h,),
+        )
+        ghost_rows = cur.fetchall()
+
         periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
 
     eligible = [r for r in top if r["status"] == "ELIGIBLE"]
@@ -252,6 +278,20 @@ def hourly_summary() -> str:
     pressure_txt = ", ".join(f"{r['base_symbol']}[obi={r['obi_20bps']:.2f},liq={r['liquidity_score']:.1f}]" for r in pressure) or "none"
     event_reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in event_rejects) or "none"
     widest_txt = ", ".join(f"{r['base_symbol']}({r['spread_bps_p95_300']:.1f}bps)" for r in widest) or "none"
+
+    cost_breakdown = {"spread_cost_dominant": 0, "slippage_dominant": 0, "vol_penalty_dominant": 0, "safety_margin_dominant": 0}
+    for row in cost_metrics:
+        try:
+            m = json.loads(row['metrics_json'] or '{}')
+            dominant = ((m.get('cost_components') or {}).get('dominant'))
+            if not dominant and m.get('bypass_cost_eval'):
+                dominant = 'spread_cost_dominant'
+            if dominant in cost_breakdown:
+                cost_breakdown[dominant] += 1
+        except Exception:
+            continue
+    cost_breakdown_txt = ", ".join(f"{k}:{v}" for k, v in cost_breakdown.items())
+    ghost_txt = ", ".join(f"{r['reject_reason']}({r['c']},avg={float(r['a'] or 0):.1f})" for r in ghost_rows) or "none"
     best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq if r['base_symbol'] not in {'USDT','USDC','USD','EUR'}) or "none"
 
     counts_line = "none"
@@ -261,6 +301,7 @@ def hourly_summary() -> str:
     external_line = "none"
     sanity_line = "none"
     regime_line = "none"
+    micro_cov_line = "none"
     sources_present_txt = "{}"
 
     if funnel:
@@ -271,6 +312,15 @@ def hourly_summary() -> str:
         external_line = str(funnel['rejects_external_json'] or '{}')
         sanity_line = str(funnel['sanity_json'] or '{}')
         regime_line = f"regime={funnel['regime'] or '-'} pressure_count={funnel['pressure_count'] or 0}"
+        try:
+            sj = json.loads(funnel['sanity_json'] or '{}')
+        except Exception:
+            sj = {}
+        micro_cov_line = (
+            f"micro_tracked_count={sj.get('micro_present', 0)} "
+            f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
+            f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
+        )
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
     cliff_hint = "none"
@@ -301,6 +351,7 @@ def hourly_summary() -> str:
         f"Rejects(tradable): {rejects_line}\n"
         f"Rejects(external): {external_line}\n"
         f"Sanity: {sanity_line}\n"
+        f"MicroCoverage: {micro_cov_line}\n"
         f"MicroStats: {regime_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
@@ -308,6 +359,8 @@ def hourly_summary() -> str:
         f"Top Actionable: {actionable_txt}\n"
         f"Top reject reasons(decision-level): {reject_txt}\n"
         f"Event-level rejects: {event_reject_txt}\n"
+        f"Cost fail breakdown: {cost_breakdown_txt}\n"
+        f"AutoTuner(tradable-only ghost 6h): {ghost_txt}\n"
         f"Micro pressure flags: {pressure_txt}\n"
         f"Micro widest spreads: {widest_txt}\n"
         f"Micro best liquidity: {best_liq_txt}\n"

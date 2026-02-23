@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 15:44 SGT
+Last updated: 2026-02-23 16:28 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -329,3 +329,34 @@ Runtime note:
   - `project_crypt.microstructure_service`
   - `project_crypt.phase2_alpha_aggregator`
   - `project_crypt.phase2_monitor_notifier`
+
+---
+
+## 2026-02-23 five-issue pass (periodic math, micro coverage, cost explainability, pressure persistence, external-lane isolation)
+1) Periodic analysis correctness
+- `_periodic_analysis` now computes 6h stage rates from `candidate_funnel_log` audited totals (`actionable_total`, `alpha_scored_total`, `cost_evaluated_total`, `cost_pass_total`, `risk_evaluated_total`, `risk_pass_total`) only.
+- No event-level leakage into stage-rate math.
+
+2) Micro coverage scaling + observability
+- `MICRO_TOP_SYMBOLS` default increased to 150 and interest-based tracked set retained with hysteresis.
+- Hourly digest now includes `MicroCoverage: micro_tracked_count, intersection_with_eligible, join_rate`.
+
+3) Cost gate explainability
+- Cost rejection dominant-cause classification added:
+  - spread_cost_dominant,
+  - slippage_dominant,
+  - vol_penalty_dominant,
+  - safety_margin_dominant.
+- Stored both costs in decision/reject metrics:
+  - `est_cost_bps_full_size`,
+  - `est_cost_bps_smallcap_lane`.
+- Hourly digest prints cost failure breakdown.
+
+4) Pressure anti-artifact persistence
+- Pressure requires persistence (`>=2 updates` or `>=30s`) in microservice.
+- Added artifact guard for extreme OBI when ask depth near-zero.
+- OBI>0.9 now logs bid/ask depth debug fields via payload metrics.
+
+5) Tradable-only tuning lane separation
+- Hourly now surfaces `AutoTuner(tradable-only ghost 6h)` from `ghost_sim_runs` filtered to mapped instrument symbols.
+- External non-tradable discovery remains visible but isolated from tradable tuning interpretation.
