@@ -87,6 +87,7 @@ def render() -> str:
         f"Current job: {status.get('job')}",
         f"State:       {status.get('state')}",
         f"Last update: {status.get('ts')}",
+        f"Kill switch active: {status.get('kill_switch_active')}",
         f"Fetched last 24h: {fetched}",
         "-" * 80,
         "FUNNEL",

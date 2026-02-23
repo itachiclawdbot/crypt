@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from project_crypt.telegram_notify import TelegramNotifier
+
 DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3")
 POLL_SECONDS = int(os.getenv("PHASE2_POLL_SECONDS", "300"))
 STATUS_PATH = os.getenv("PHASE2_STATUS_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
@@ -23,6 +25,9 @@ DEX_BOOSTED_TOKENS_ENDPOINT = os.getenv("DEX_BOOSTED_TOKENS_ENDPOINT", "/token-b
 TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
 MIN_ACTIONABLE_SCORE = float(os.getenv("PHASE2_MIN_ACTIONABLE_SCORE", "70"))
 MIN_ELIGIBLE_SCORE = float(os.getenv("PHASE2_MIN_ELIGIBLE_SCORE", "45"))
+DISCOVERY_TICK_SECONDS = int(os.getenv("PHASE2_DISCOVERY_TICK_SECONDS", "120"))
+MARKET_TICK_SECONDS = int(os.getenv("PHASE2_MARKET_TICK_SECONDS", "60"))
+KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", "/var/run/cryptobot/STOP")
 
 
 class Source:
@@ -35,6 +40,10 @@ class Source:
     X = "x"
     REDDIT = "reddit"
     SYSTEM = "system"
+
+
+def is_kill_switch_active() -> bool:
+    return os.path.exists(KILL_SWITCH_FILE)
 
 
 def utc_now() -> str:
@@ -540,19 +549,89 @@ def run_cycle() -> dict:
 
 def main() -> None:
     init_tables()
-    write_status({"state": "starting", "job": "boot"})
+    tg = TelegramNotifier()
+    kill_switch_alerted = False
+    write_status({"state": "starting", "job": "boot", "kill_switch_active": is_kill_switch_active()})
     while True:
+        if is_kill_switch_active():
+            write_status({
+                "state": "halted",
+                "job": "kill_switch_hold",
+                "kill_switch_active": True,
+                "kill_switch_file": KILL_SWITCH_FILE,
+            })
+            put_signal(None, Source.SYSTEM, "kill_switch_active", {"kill_switch_file": KILL_SWITCH_FILE}, conviction="watch")
+            if not kill_switch_alerted:
+                msg = f"[Project Crypt][CRITICAL] Kill switch active. All proposals denied. file={KILL_SWITCH_FILE}"
+                tg.send(msg)
+                kill_switch_alerted = True
+            time.sleep(15)
+            continue
+
+        if kill_switch_alerted:
+            tg.send("[Project Crypt] Kill switch cleared. Phase-2 shadow pipeline resumed.")
+            kill_switch_alerted = False
+
         t0 = time.time()
         try:
             summary = run_cycle()
-            write_status({"state": "cycle_complete", "job": "sleeping", "last_cycle_seconds": round(time.time() - t0, 2), "last_cycle_summary": summary})
+            write_status({
+                "state": "cycle_complete",
+                "job": "sleeping",
+                "last_cycle_seconds": round(time.time() - t0, 2),
+                "last_cycle_summary": summary,
+                "kill_switch_active": False,
+            })
         except Exception as e:
             put_signal(None, Source.SYSTEM, "cycle_error", {"error": str(e)})
-            write_status({"state": "error", "job": "cycle_error", "error": str(e)})
+            write_status({"state": "error", "job": "cycle_error", "error": str(e), "kill_switch_active": is_kill_switch_active()})
+
         jitter = random.uniform(-0.1 * POLL_SECONDS, 0.1 * POLL_SECONDS)
-        sleep_for = max(30, int(POLL_SECONDS + jitter - (time.time() - t0)))
-        write_status({"state": "sleeping", "job": "waiting_next_cycle", "sleep_for": sleep_for})
-        time.sleep(sleep_for)
+        cycle_wait = max(30, int(POLL_SECONDS + jitter - (time.time() - t0)))
+        next_cycle_at = time.time() + cycle_wait
+        next_market_tick = time.time() + max(20, MARKET_TICK_SECONDS)
+        next_discovery_tick = time.time() + max(30, DISCOVERY_TICK_SECONDS)
+
+        write_status({
+            "state": "sleeping",
+            "job": "waiting_next_cycle",
+            "sleep_for": cycle_wait,
+            "kill_switch_active": False,
+            "next_market_tick_s": MARKET_TICK_SECONDS,
+            "next_discovery_tick_s": DISCOVERY_TICK_SECONDS,
+        })
+
+        while time.time() < next_cycle_at:
+            if is_kill_switch_active():
+                break
+
+            now = time.time()
+            if now >= next_market_tick:
+                try:
+                    write_status({"state": "running", "job": "market_fast_tick", "kill_switch_active": False})
+                    symbols = ingest_cryptocom()
+                    put_signal(None, Source.SYSTEM, "market_fast_tick", {"symbols": len(symbols)})
+                except Exception as e:
+                    put_signal(None, Source.SYSTEM, "market_fast_tick_error", {"error": str(e)})
+                next_market_tick = now + max(20, MARKET_TICK_SECONDS)
+
+            if now >= next_discovery_tick:
+                try:
+                    write_status({"state": "running", "job": "discovery_fast_tick", "kill_switch_active": False})
+                    cg = ingest_coingecko()
+                    dex_latest, dex_boosted, _ = ingest_dex()
+                    news_hits = ingest_news()
+                    put_signal(None, Source.SYSTEM, "discovery_fast_tick", {
+                        "coingecko": len(cg),
+                        "dex_latest": len(dex_latest),
+                        "dex_boosted": len(dex_boosted),
+                        "news_hits": news_hits,
+                    })
+                except Exception as e:
+                    put_signal(None, Source.SYSTEM, "discovery_fast_tick_error", {"error": str(e)})
+                next_discovery_tick = now + max(30, DISCOVERY_TICK_SECONDS)
+
+            time.sleep(5)
 
 
 if __name__ == "__main__":
