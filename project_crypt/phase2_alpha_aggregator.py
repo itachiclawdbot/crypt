@@ -1000,6 +1000,40 @@ def run_cycle() -> dict:
     dynamic_min_volume = max(100000.0, _percentile(venue_vols, 0.25, 100000.0))
     dynamic_max_spread_bps = min(50.0, _percentile(venue_spreads, 0.75, 50.0))
 
+    # Top-K alpha gating fallback when social is unavailable.
+    social_missing = (not sources_present.get(Source.X)) and (not sources_present.get(Source.REDDIT))
+    topk_alpha_syms: set[str] = set()
+    TOPK_ALPHA = int(os.getenv("PHASE2_ALPHA_TOPK", "20"))
+    if social_missing:
+        pre = []
+        for _sym in discovered:
+            s = str(_sym).upper().strip()
+            if s in {"USDT", "USDC", "USD", "EUR"} or not s.replace("$", "").replace("-", "").replace("_", "").isalnum():
+                continue
+            if s not in crypto_bases:
+                continue
+            _venue = venue_metrics.get(s, {})
+            _micro = micro_latest.get(s, {})
+            _vol = float(_venue.get("volume_24h_quote", dex_metrics.get(s, {}).get("volume24h", 0.0)))
+            _spread = float(_micro.get("spread_bps_p95_300", _venue.get("spread_bps", 9999.0)))
+            _liq = float(_micro.get("liquidity_score", (_vol / max(1.0, TARGET_NOTIONAL_USDT))))
+            _elig = 0.0
+            if _vol >= dynamic_min_volume:
+                _elig += 30
+            if _spread <= dynamic_max_spread_bps:
+                _elig += 20
+            if _liq >= 10:
+                _elig += 20
+            elif _liq >= 5:
+                _elig += 10
+            _elig += 30
+            if _elig < MIN_ELIGIBLE_SCORE:
+                continue
+            _alpha, _, _ = weighted_alpha(s, cg, cmc, dex_latest, dex_boosted, venue_movers, sources_present, venue_metrics)
+            pre.append((s, _alpha))
+        pre.sort(key=lambda x: x[1], reverse=True)
+        topk_alpha_syms = {x[0] for x in pre[:TOPK_ALPHA]}
+
     for sym in discovered:
         sym_norm = str(sym).upper().strip()
         if sym_norm in {"USDT", "USDC", "USD", "EUR"} or not sym_norm.replace("$", "").replace("-", "").replace("_", "").isalnum():
@@ -1114,13 +1148,22 @@ def run_cycle() -> dict:
             if (not sources_present.get(Source.X) and not sources_present.get(Source.REDDIT) and sym in venue_movers and obi20 >= 0.5 and liquidity_cover >= 20):
                 alpha_floor_effective = 50.0
                 alpha_floor_override_count += 1
-            if alpha_score < alpha_floor_effective:
+            alpha_gate_pass = (alpha_score >= alpha_floor_effective)
+            if social_missing and sym in topk_alpha_syms:
+                alpha_gate_pass = True
+            if not alpha_gate_pass:
                 deny_stage = "alpha"
                 stage_reached = "alpha"
                 deny_reason = "alpha-score-below-threshold"
                 reject_counter[deny_reason] += 1
                 rejects_tradable["alpha"] += 1
-                log_reject(sym, deny_stage, deny_reason, {"alpha_score": alpha_score, "confidence": confidence, "alpha_floor_effective": alpha_floor_effective})
+                log_reject(sym, deny_stage, deny_reason, {
+                    "alpha_score": alpha_score,
+                    "confidence": confidence,
+                    "alpha_floor_effective": alpha_floor_effective,
+                    "topk_override_active": social_missing,
+                    "in_topk": sym in topk_alpha_syms,
+                })
             else:
                 alpha_pass_count += 1
                 stage_reached = "alpha"
@@ -1237,6 +1280,7 @@ def run_cycle() -> dict:
 
     eligible_syms = {x["symbol"] for x in eligible_rows + actionable_rows}
     micro_join = len([s for s in eligible_syms if s in micro_latest])
+    micro_join_fail = max(0, len(eligible_syms) - micro_join)
     llama_join = len([s for s in eligible_syms if s in llama_syms])
     dex_join = len([s for s in eligible_syms if s in dex_latest or s in dex_boosted])
     denom = max(1, len(eligible_syms))
@@ -1251,6 +1295,7 @@ def run_cycle() -> dict:
             "defillama": round(llama_join / denom, 3),
             "dex": round(dex_join / denom, 3),
         },
+        "micro_join_fail": micro_join_fail,
     }
 
     log_funnel(
@@ -1295,8 +1340,17 @@ def run_cycle() -> dict:
         "alpha_scored_total": alpha_scored_count,
         "cost_evaluated_total": cost_evaluated_count,
         "risk_evaluated_total": risk_evaluated_count,
+        "stage_reach": {
+            "scored": alpha_scored_count,
+            "costed": cost_evaluated_count,
+            "cost_pass": cost_pass_count,
+            "risked": risk_evaluated_count,
+            "sized": risk_pass_count,
+            "actionable": len(actionable_rows),
+        },
         "alpha_floor_effective": 50 if alpha_floor_override_count > 0 else MIN_ACTIONABLE_SCORE,
         "alpha_floor_overrides": alpha_floor_override_count,
+        "alpha_override_active_count": alpha_floor_override_count,
         "regime": regime,
         "pressure_count": pressure_count,
         "sanity": sanity,

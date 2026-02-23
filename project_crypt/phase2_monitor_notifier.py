@@ -160,6 +160,27 @@ def hourly_summary() -> str:
         )
         top = [r for r in cur.fetchall() if r['rn'] == 1][:30]
 
+        # Decision-level reject stats (deduped one decision per instrument per cycle window)
+        cur.execute(
+            """
+            with latest as (
+              select coalesce(instrument_symbol,symbol) as ikey, deny_reason,
+                     row_number() over (partition by coalesce(instrument_symbol,symbol) order by id desc) rn
+              from universe_state
+              where ts >= ? and deny_reason is not null
+            )
+            select deny_reason as reason, count(*) c
+            from latest
+            where rn=1
+            group by deny_reason
+            order by c desc
+            limit 8
+            """,
+            (since,),
+        )
+        rejects = cur.fetchall()
+
+        # Event-level reject stats (separate section)
         cur.execute(
             """
             select reason, count(*) c
@@ -167,11 +188,11 @@ def hourly_summary() -> str:
             where ts >= ?
             group by reason
             order by c desc
-            limit 8
+            limit 6
             """,
             (since,),
         )
-        rejects = cur.fetchall()
+        event_rejects = cur.fetchall()
 
         cur.execute(
             """
@@ -206,9 +227,15 @@ def hourly_summary() -> str:
 
         periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
 
-    watch = [r for r in top if r["status"] == "WATCH"][:10]
-    eligible = [r for r in top if r["status"] == "ELIGIBLE"][:10]
+    eligible = [r for r in top if r["status"] == "ELIGIBLE"]
+    watch = [r for r in top if r["status"] == "WATCH"]
     actionable = [r for r in top if r["status"] == "ACTIONABLE"][:5]
+
+    # Issue-1 fix: watchlist is inclusive union (WATCH ∪ ELIGIBLE), ranked by alpha.
+    watch_union = sorted((watch + eligible), key=lambda r: float(r["alpha_score"] or 0), reverse=True)
+    watch_top = watch_union[:10]
+    eligible = eligible[:10]
+    watch = watch[:10]
 
     src_txt = ", ".join(f"{r['source']}:{r['c']}" for r in by_source) or "none"
     sig_txt = ", ".join(f"{r['signal_type']}:{r['c']}" for r in top_signals) or "none"
@@ -216,16 +243,18 @@ def hourly_summary() -> str:
     pot_txt = ", ".join(f"{r['symbol']}[{r['conviction']}]" for r in potentials if r['symbol']) or "none"
     health_txt = ", ".join(f"{r['source_name']}={r['status']}({r['c']})" for r in health) or "none"
 
-    watch_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f}:{r['deny_reason'] or 'ok'})" for r in watch) or "none"
+    watch_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f}:{r['deny_reason'] or 'ok'})" for r in watch_top) or "none"
     eligible_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in eligible) or "none"
     actionable_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in actionable) or "none"
     reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in rejects) or "none"
     pressure_txt = ", ".join(f"{r['base_symbol']}[obi={r['obi_20bps']:.2f},liq={r['liquidity_score']:.1f}]" for r in pressure) or "none"
+    event_reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in event_rejects) or "none"
     widest_txt = ", ".join(f"{r['base_symbol']}({r['spread_bps_p95_300']:.1f}bps)" for r in widest) or "none"
     best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq if r['base_symbol'] not in {'USDT','USDC','USD','EUR'}) or "none"
 
     counts_line = "none"
     eval_line = "none"
+    stages_line = "none"
     rejects_line = "none"
     external_line = "none"
     sanity_line = "none"
@@ -235,11 +264,18 @@ def hourly_summary() -> str:
     if funnel:
         counts_line = f"WATCH={funnel['watch_total'] or 0} ELIGIBLE={funnel['eligible_total'] or 0} ACTIONABLE={funnel['actionable_total'] or 0}"
         eval_line = f"alpha_scored={funnel['alpha_scored_total'] or 0} cost_eval={funnel['cost_evaluated_total'] or 0} risk_eval={funnel['risk_evaluated_total'] or 0}"
+        stages_line = f"scored={funnel['alpha_scored_total'] or 0} costed={funnel['cost_evaluated_total'] or 0} cost_pass={funnel['cost_pass_total'] or 0} risked={funnel['risk_evaluated_total'] or 0} risk_pass={funnel['risk_pass_total'] or 0} sized={funnel['risk_pass_total'] or 0} actionable={funnel['actionable_total'] or 0}"
         rejects_line = str(funnel['rejects_tradable_json'] or '{}')
         external_line = str(funnel['rejects_external_json'] or '{}')
         sanity_line = str(funnel['sanity_json'] or '{}')
         regime_line = f"regime={funnel['regime'] or '-'} pressure_count={funnel['pressure_count'] or 0}"
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
+
+    cliff_hint = "none"
+    if funnel and int(funnel['risk_evaluated_total'] or 0) == 0 and int(funnel['cost_pass_total'] or 0) == 0:
+        cliff_hint = "No candidates reached risk stage because cost_pass=0 (cost gate is current cliff)."
+    elif funnel and int(funnel['risk_evaluated_total'] or 0) == 0:
+        cliff_hint = "No candidates reached risk stage this window."
 
     examples = actionable[:3] if actionable else watch[:3]
     ex_txt = "; ".join(
@@ -258,6 +294,8 @@ def hourly_summary() -> str:
         f"Source health: {health_txt}\n"
         f"Counts: {counts_line}\n"
         f"Evaluated: {eval_line}\n"
+        f"Stages: {stages_line}\n"
+        f"CliffHint: {cliff_hint}\n"
         f"Rejects(tradable): {rejects_line}\n"
         f"Rejects(external): {external_line}\n"
         f"Sanity: {sanity_line}\n"
@@ -266,7 +304,8 @@ def hourly_summary() -> str:
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
         f"Top Actionable: {actionable_txt}\n"
-        f"Top reject reasons: {reject_txt}\n"
+        f"Top reject reasons(decision-level): {reject_txt}\n"
+        f"Event-level rejects: {event_reject_txt}\n"
         f"Micro pressure flags: {pressure_txt}\n"
         f"Micro widest spreads: {widest_txt}\n"
         f"Micro best liquidity: {best_liq_txt}\n"

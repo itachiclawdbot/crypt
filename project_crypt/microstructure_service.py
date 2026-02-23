@@ -12,7 +12,7 @@ import requests
 
 DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3")
 POLL_SECONDS = int(os.getenv("MICRO_POLL_SECONDS", "30"))
-TOP_SYMBOLS = int(os.getenv("MICRO_TOP_SYMBOLS", "30"))
+TOP_SYMBOLS = int(os.getenv("MICRO_TOP_SYMBOLS", "80"))
 TARGET_NOTIONAL_USDT = float(os.getenv("PHASE2_TARGET_NOTIONAL_USDT", "300"))
 
 
@@ -81,6 +81,26 @@ def get_json(url: str) -> dict | list:
     return r.json()
 
 
+def _active_universe_symbols(limit: int) -> list[str]:
+    with db() as c:
+        cur = c.cursor()
+        cur.execute(
+            """
+            select coalesce(instrument_symbol,'') inst
+            from universe_state
+            where ts >= datetime('now','-2 hours')
+              and status in ('WATCH','ELIGIBLE','ACTIONABLE')
+              and instrument_symbol is not null
+              and quote_ccy in ('USDT','USD','USDC','EUR')
+            group by instrument_symbol
+            order by max(alpha_score) desc
+            limit ?
+            """,
+            (limit,),
+        )
+        return [str(r[0]).upper() for r in cur.fetchall() if r[0]]
+
+
 def top_symbols() -> list[str]:
     d = get_json("https://api.crypto.com/exchange/v1/public/get-tickers")
     rows = d.get("result", {}).get("data", []) if isinstance(d, dict) else []
@@ -90,14 +110,28 @@ def top_symbols() -> list[str]:
         if "_" not in inst:
             continue
         base, quote = inst.split("_", 1)
-        if quote not in {"USD", "USDT"}:
+        if quote not in {"USD", "USDT", "USDC", "EUR"}:
+            continue
+        if base in {"USDT", "USDC", "USD", "EUR"}:
             continue
         vol_quote = float(r.get("vv") or 0.0)
         if vol_quote <= 0:
             continue
         pairs.append((inst, vol_quote))
     pairs.sort(key=lambda x: x[1], reverse=True)
-    return [p[0] for p in pairs[:TOP_SYMBOLS]]
+
+    top_vol = [p[0] for p in pairs[: max(20, TOP_SYMBOLS // 2)]]
+    active = _active_universe_symbols(max(20, TOP_SYMBOLS))
+
+    merged = []
+    seen = set()
+    for s in active + top_vol:
+        if s not in seen:
+            seen.add(s)
+            merged.append(s)
+        if len(merged) >= TOP_SYMBOLS:
+            break
+    return merged
 
 
 def depth_usd_in_band(levels: list[list[str]], low: float, high: float) -> float:

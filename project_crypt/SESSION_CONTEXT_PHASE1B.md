@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 14:20 SGT
+Last updated: 2026-02-23 15:03 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -191,6 +191,23 @@ In the next session, load these for full context:
   - added `ghost_sim_runs` table and hourly async ghost simulation from rejected mapped signals (5m horizon heuristic).
 - Migration artifact added:
   - `project_crypt/migrations/2026-02-23_phase2_reliability_bridge_alpha.sql`
+
+### 14) Four-issue reconciliation pass (watchlist/reject math/stage visibility/micro coverage)
+- Issue 1 (watchlist none bug):
+  - notifier now renders watchlist from `WATCH ∪ ELIGIBLE` ranked by alpha score (with deny reason), not from restrictive sub-filters.
+- Issue 2 (reject reconciliation):
+  - notifier reject reasons now sourced from decision-level `universe_state` (deduped by instrument),
+  - event-level rejects retained in separate line from `candidate_reject_log`.
+- Issue 3 (risk_eval=0 ambiguity):
+  - hourly adds explicit stage reach line:
+    - `scored`, `costed`, `cost_pass`, `risked`, `risk_pass`, `sized`, `actionable`.
+  - adds `CliffHint` when risk stage is unreachable because cost pass is zero.
+- Issue 4 (micro join too low):
+  - microstructure service upgraded from fixed top-30 to dynamic active-universe tracking (default top-80),
+  - tracks union of recent candidate instruments + top-volume instruments,
+  - allows micro coverage to follow active decision universe instead of only blue chips.
+- Additional tactical gate improvement:
+  - social-missing top-K alpha fallback (`PHASE2_ALPHA_TOPK`, default 20) among eligible mapped symbols to avoid hard alpha deadlocks.
 
 ---
 
