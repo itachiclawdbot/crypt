@@ -1,6 +1,6 @@
 # Project Crypt — Session Context Memory (Phase-1 → Phase-1B/Phase-2)
 
-Last updated: 2026-02-23 01:25 SGT
+Last updated: 2026-02-23 08:12 SGT
 Owner: Hari
 Assistant: Itachi
 
@@ -54,6 +54,23 @@ In the next session, load these for full context:
 - Full architecture-format document created:
   - `project_crypt/architecture/PHASE1B_ARCHITECTURE.md`
 
+### 7) Funnel observability + resilient scoring rollout (shadow mode)
+- Added cycle-level funnel telemetry to stop blind threshold tuning:
+  - `candidate_funnel_log` (discovered→mapped→eligible→alpha→risk→cost→proposed)
+  - `candidate_reject_log` (symbol, stage, reason, metrics)
+  - `universe_state` (per-symbol status, scores, deny stage/reason, source map)
+- Replaced hard alignment dependency with weighted alpha scoring that degrades gracefully when X/Reddit are unavailable.
+- Added ranked outputs every cycle:
+  - top watchlist,
+  - top eligible,
+  - top actionable.
+- Added fast tick architecture:
+  - market mini-refresh every 60s (default),
+  - discovery mini-refresh every 120s (default),
+  - full decision cycle every 300s (default).
+- Added startup Telegram ping after first successful cycle with funnel snapshot and top candidates.
+- Added kill-switch runtime visibility + critical alert behavior in aggregator/dashboard status.
+
 ---
 
 ## Current source strategy (active)
@@ -73,9 +90,18 @@ X/Reddit direct ingestion:
 ---
 
 ## Runtime behavior currently expected
-- `phase2_alpha_aggregator.py`: 300s loop (+ jitter), writes `intel_cache`, `source_health_log`, and `phase2_status.json`.
-- `phase2_monitor_notifier.py`: hourly Telegram digest.
-- `phase2_ops_dashboard.py`: displays current jobs, latest cycle summary, and source health.
+- `phase2_alpha_aggregator.py`: 300s full cycle (+ jitter), writes `intel_cache`, `source_health_log`, `candidate_funnel_log`, `candidate_reject_log`, `universe_state`, and `phase2_status.json`.
+- Fast sub-ticks inside cycle wait window:
+  - market fast tick (`PHASE2_MARKET_TICK_SECONDS`, default 60s)
+  - discovery fast tick (`PHASE2_DISCOVERY_TICK_SECONDS`, default 120s)
+- Startup ping behavior:
+  - after first successful cycle post-boot, sends Telegram startup summary with funnel + top actionable/watchlist + tick intervals.
+- Kill-switch behavior:
+  - checks `KILL_SWITCH_FILE` (default `/var/run/cryptobot/STOP`), enters halted hold loop if present,
+  - emits critical Telegram alert once while active,
+  - status JSON includes `kill_switch_active` for dashboard visibility.
+- `phase2_monitor_notifier.py`: hourly Telegram digest now includes funnel metrics + top watch/eligible/actionable + reject reasons.
+- `phase2_ops_dashboard.py`: displays funnel stages, top reject reasons, top watch/eligible/actionable, and kill-switch flag.
 
 ---
 

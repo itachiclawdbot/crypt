@@ -395,6 +395,29 @@ def log_funnel(discovered: int, mapped: int, eligible: int, alpha_pass: int, ris
         )
 
 
+def build_startup_ping(summary: dict) -> str:
+    funnel = (
+        f"discovered={summary.get('discovered_total', 0)} "
+        f"mapped={summary.get('mapped_to_venue_total', 0)} "
+        f"eligible={summary.get('eligible_total', 0)} "
+        f"alpha={summary.get('alpha_pass_total', 0)} "
+        f"risk={summary.get('risk_pass_total', 0)} "
+        f"cost={summary.get('cost_pass_total', 0)} "
+        f"proposed={summary.get('proposed_total', 0)}"
+    )
+    top_actionable = summary.get("actionable_top", [])[:3]
+    top_watch = summary.get("watchlist_top", [])[:3]
+    action_txt = ", ".join(f"{x.get('symbol')}({x.get('alpha_score')})" for x in top_actionable) or "none"
+    watch_txt = ", ".join(f"{x.get('symbol')}({x.get('alpha_score')})" for x in top_watch) or "none"
+    return (
+        "[Project Crypt][Phase-2] startup complete\n"
+        f"Funnel: {funnel}\n"
+        f"Top actionable: {action_txt}\n"
+        f"Top watchlist: {watch_txt}\n"
+        f"Fast ticks: market={MARKET_TICK_SECONDS}s discovery={DISCOVERY_TICK_SECONDS}s full_cycle={POLL_SECONDS}s"
+    )
+
+
 def run_cycle() -> dict:
     write_status({"state": "running", "job": "ingest_cryptocom"})
     crypto_symbols = ingest_cryptocom()
@@ -551,6 +574,7 @@ def main() -> None:
     init_tables()
     tg = TelegramNotifier()
     kill_switch_alerted = False
+    startup_ping_sent = False
     write_status({"state": "starting", "job": "boot", "kill_switch_active": is_kill_switch_active()})
     while True:
         if is_kill_switch_active():
@@ -574,7 +598,11 @@ def main() -> None:
 
         t0 = time.time()
         try:
+            # Full decision cycle: ingest -> score -> funnel logging -> ranked outputs.
             summary = run_cycle()
+            if not startup_ping_sent:
+                tg.send(build_startup_ping(summary))
+                startup_ping_sent = True
             write_status({
                 "state": "cycle_complete",
                 "job": "sleeping",
