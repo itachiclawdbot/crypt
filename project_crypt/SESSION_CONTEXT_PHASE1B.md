@@ -467,3 +467,36 @@ Mandatory post-change notes to append each time:
 Operational rule:
 - Do not wait for user reminder.
 - Treat context update as part of “definition of done” for every code change.
+
+---
+
+## 2026-02-25 reliability hardening (notifier resilience + auto-restart)
+1) Decision change summary
+- Root cause of missing hourly Telegram alerts: process-termination events (`SIGTERM`) killed notifier/runtime sessions.
+- Added dual-layer resilience: process watchdog + notifier heartbeat guard.
+
+2) Routing/flow impact
+- Existing phase2 watchdog remains minute-level restart for all 3 services.
+- New notifier guard runs every 15 minutes and performs fallback force-send if heartbeat is stale (>75m).
+
+3) Data-structure/schema impact
+- No SQLite schema change.
+- Added file-based heartbeat state:
+  - `project_crypt/phase2_notifier_heartbeat.json`
+- Added guard logs:
+  - `project_crypt/phase2_notifier_guard.log`
+
+4) Runtime/ops impact
+- `phase2_monitor_notifier.py` now logs startup/sleep/send outcomes to `phase2_monitor_notifier.log` and writes heartbeat after send attempts.
+- New script: `project_crypt/phase2_notifier_guard.sh`.
+- Cron entries now include:
+  - `* * * * * phase2_watchdog.sh`
+  - `*/15 * * * * phase2_notifier_guard.sh`
+
+5) Validation evidence
+- Verified services running with active PIDs.
+- Force Telegram send succeeded (`telegram_send_ok True`).
+- Guard script executed and heartbeat file updated with `ok=true` timestamp.
+
+6) Git traceability
+- Pending commit in `phase2-working` for notifier resilience changes.

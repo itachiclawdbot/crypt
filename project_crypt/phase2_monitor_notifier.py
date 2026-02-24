@@ -4,11 +4,14 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from project_crypt.telegram_notify import TelegramNotifier
 
 DB_PATH = "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3"
+NOTIFIER_LOG = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_monitor_notifier.log")
+NOTIFIER_HEARTBEAT = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_notifier_heartbeat.json")
 DISPLAY_EXCLUDE_BASES = {x.strip().upper() for x in ("USDT,USDC,USD,EUR,PYUSD,TUSD,USDP,BUSD,DAI,FDUSD,USDE,USAT,USD1").split(",") if x.strip()}
 
 
@@ -395,6 +398,25 @@ def hourly_summary() -> str:
     )
 
 
+def _append_log(msg: str) -> None:
+    try:
+        with NOTIFIER_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _write_heartbeat(ok: bool, error: str | None = None) -> None:
+    try:
+        NOTIFIER_HEARTBEAT.write_text(json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ok": bool(ok),
+            "error": error,
+        }))
+    except Exception:
+        pass
+
+
 def seconds_until_next_hour_sgt() -> int:
     sgt = ZoneInfo("Asia/Singapore")
     now = datetime.now(sgt)
@@ -404,15 +426,20 @@ def seconds_until_next_hour_sgt() -> int:
 
 def main() -> None:
     tg = TelegramNotifier()
+    _append_log("notifier_start")
     # Align notifications to fixed wall-clock hour boundaries in Singapore time
     # (e.g., 16:00, 17:00, 18:00) regardless of process restarts.
     while True:
         sleep_s = seconds_until_next_hour_sgt()
+        _append_log(f"sleep_until_next_hour_s={sleep_s}")
         time.sleep(sleep_s)
         try:
-            tg.send(hourly_summary())
-        except Exception:
-            pass
+            ok = bool(tg.send(hourly_summary()))
+            _append_log(f"hourly_send_ok={ok}")
+            _write_heartbeat(ok=ok, error=None if ok else "send_returned_false")
+        except Exception as e:
+            _append_log(f"hourly_send_error={e}")
+            _write_heartbeat(ok=False, error=str(e))
 
 
 if __name__ == "__main__":
