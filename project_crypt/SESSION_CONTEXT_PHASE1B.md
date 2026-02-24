@@ -450,3 +450,20 @@ Runtime note:
 - Added strict pressure confidence score based on persistence, liquidity, and spread stability.
 - Retained artifact guard for extreme OBI with thin-side depth.
 - Added hourly digest observability lines for safety breakdown and risk reason code distribution.
+
+---
+
+## Persistent update protocol (effective 2026-02-24)
+Owner directive: After **every meaningful modification** (logic/routing/schema/ops behavior), update this session context file in the same work pass.
+
+Mandatory post-change notes to append each time:
+1) Decision change summary (what changed and why)
+2) Routing/flow impact (where in pipeline it now applies)
+3) Data-structure/schema impact (tables/columns/json fields)
+4) Runtime/ops impact (services, schedules, watchdogs, alerts)
+5) Validation evidence (compile/tests/query/telegram force check)
+6) Git traceability (branch + commit hash)
+
+Operational rule:
+- Do not wait for user reminder.
+- Treat context update as part of “definition of done” for every code change.
