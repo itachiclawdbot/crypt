@@ -22,6 +22,19 @@ def pgrep(pattern: str) -> str:
     return p.stdout.strip().splitlines()[0] if p.stdout.strip() else "down"
 
 
+def fmt_proc(line: str) -> str:
+    if line == "down":
+        return "DOWN"
+    try:
+        pid, etimes, *cmd = line.split()
+        sec = int(float(etimes))
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return f"UP pid={pid} uptime={h:02d}:{m:02d}:{s:02d} {' '.join(cmd[-2:])}"
+    except Exception:
+        return f"UP {line}"
+
+
 def read_status() -> dict:
     if not os.path.exists(STATUS_PATH):
         return {"state": "unknown", "job": "no status file"}
@@ -34,6 +47,7 @@ def render() -> str:
     status = read_status()
     agg = pgrep("python3 -m project_crypt.phase2_alpha_aggregator")
     mon = pgrep("python3 -m project_crypt.phase2_monitor_notifier")
+    mic = pgrep("python3 -m project_crypt.microstructure_service")
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     since_1h = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
@@ -110,7 +124,9 @@ def render() -> str:
 
         cur.execute(
             """
-            select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,reasons_json,sources_present_json,ts
+            select discovered_total,mapped_to_venue_total,eligible_total,alpha_pass_total,risk_pass_total,cost_pass_total,proposed_total,
+                   watch_total,actionable_total,alpha_scored_total,cost_evaluated_total,risk_evaluated_total,
+                   reasons_json,sources_present_json,sanity_json,regime,pressure_count,ts
             from candidate_funnel_log
             order by id desc limit 1
             """
@@ -140,17 +156,39 @@ def render() -> str:
         )
         rejects = cur.fetchall()
 
+        cur.execute(
+            """
+            select base_symbol,obi_20bps,pressure_confidence,liquidity_score
+            from micro_features_latest
+            where pressure_flag=1
+            order by pressure_confidence desc, abs(obi_20bps) desc
+            limit 8
+            """
+        )
+        pressure = cur.fetchall()
+
+        cur.execute(
+            """
+            select base_symbol,liquidity_score,spread_bps_p95_300
+            from micro_features_latest
+            order by liquidity_score desc
+            limit 8
+            """
+        )
+        liq = cur.fetchall()
+
     watch = [r for r in universe if r["status"] == "WATCH"][:10]
     eligible = [r for r in universe if r["status"] in {"ELIGIBLE", "ACTIONABLE"}][:10]
     actionable = [r for r in universe if r["status"] == "ACTIONABLE"][:5]
 
     lines = [
         "PROJECT CRYPT PHASE-2 OPS DASHBOARD",
-        "=" * 100,
+        "=" * 120,
         f"Now: {now}",
-        f"Aggregator: {agg}",
-        f"Notifier:   {mon}",
-        "-" * 100,
+        f"Aggregator: {fmt_proc(agg)}",
+        f"Notifier:   {fmt_proc(mon)}",
+        f"MicroSvc:   {fmt_proc(mic)}",
+        "-" * 120,
         f"Current job: {status.get('job')}",
         f"State:       {status.get('state')}",
         f"Last update: {status.get('ts')}",
@@ -170,12 +208,14 @@ def render() -> str:
 
     if funnel:
         lines.append(
-            f" discovered={funnel['discovered_total']} -> mapped={funnel['mapped_to_venue_total']} -> eligible={funnel['eligible_total']}"
+            f" discovered={funnel['discovered_total']} -> mapped={funnel['mapped_to_venue_total']} -> eligible={funnel['eligible_total']} -> watch={funnel['watch_total'] or 0} -> actionable={funnel['actionable_total'] or 0}"
         )
         lines.append(
-            f" alpha_pass={funnel['alpha_pass_total']} -> risk_pass={funnel['risk_pass_total']} -> cost_pass={funnel['cost_pass_total']} -> proposed={funnel['proposed_total']}"
+            f" alpha_scored={funnel['alpha_scored_total'] or 0} -> cost_eval={funnel['cost_evaluated_total'] or 0} -> cost_pass={funnel['cost_pass_total']} -> risk_eval={funnel['risk_evaluated_total'] or 0} -> risk_pass={funnel['risk_pass_total']} -> proposed={funnel['proposed_total']}"
         )
+        lines.append(f" regime={funnel['regime'] or '-'} pressure_count={funnel['pressure_count'] or 0}")
         lines.append(f" sources_present={funnel['sources_present_json']}")
+        lines.append(f" sanity={funnel['sanity_json']}")
         lines.append(f" top_reasons={funnel['reasons_json']}")
     else:
         lines.append(" no funnel data yet")
@@ -191,6 +231,12 @@ def render() -> str:
 
     lines += ["-" * 100, "TOP REJECT REASONS (24h)"]
     lines += [f" - {r['reason']}: {r['c']}" for r in rejects] or [" - none"]
+
+    lines += ["-" * 100, "MICRO PRESSURE (live)"]
+    lines += [f" - {r['base_symbol']} obi={float(r['obi_20bps'] or 0):.2f} conf={float(r['pressure_confidence'] or 0):.2f} liq={float(r['liquidity_score'] or 0):.1f}x" for r in pressure] or [" - none"]
+
+    lines += ["-" * 100, "MICRO BEST LIQUIDITY"]
+    lines += [f" - {r['base_symbol']} liq={float(r['liquidity_score'] or 0):.1f}x spread_p95={float(r['spread_bps_p95_300'] or 0):.1f}bps" for r in liq] or [" - none"]
 
     if funnel and int(funnel["proposed_total"]) == 0:
         lines += ["-" * 100, "ALERT: NO ACTIONABLE CANDIDATES", "Check funnel stage drops + source availability map."]
