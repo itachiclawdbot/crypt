@@ -616,3 +616,36 @@ Operational rule:
 
 6) Git traceability
 - Pending commit in `phase2-working` for unified 14-issue wave.
+
+---
+
+## 2026-02-25 unified churn safety + tuner fidelity + governor UX wave (16 issues)
+1) Decision summary
+- Added strict churn taxonomy with dedicated telemetry (`ATTEMPT`, `EXECUTION`, `EVALUATION` semantics).
+- Added hot-loop protection and tiered churn controls (symbol penalty box, systemic attempt churn halt).
+- Hardened RiskState to differentiate `COOLDOWN` from active triggers; retained `previous_halt_reason`.
+- Improved autotuner fidelity (decision-time cost ghosting, stratified sampling, robust/tail stats, shock-tagged rows).
+- Extended governor UX to multi-cause suspension reasons list.
+
+2) Routing/flow impact
+- Risk machine now reads churn from `churn_event_log` (attempt vs execution windows) rather than inferred universe-only counts.
+- BLOODBATH lane logs explicit attempt/execution outcomes and respects penalty boxes.
+- During global halt, downstream behavior remains `RISK_GLOBAL_HALT` / blocked state.
+
+3) Data/schema impact
+- Added tables: `churn_event_log`, `symbol_penalty_box`, `macro_state_current`, `parameter_governor_log`.
+- Extended `risk_state_current` with `previous_halt_reason`, `attempt_churn_count`, `execution_churn_count`, `loss_pressure_24h`.
+- Extended `ghost_sim_runs` with `macro_shock`, `estimated_cost_bps`, `execution_style`.
+
+4) Runtime/ops impact
+- Macro shock hysteresis avoids sticky always-on shock mode.
+- BLOODBATH non-fill default is `EXPIRED_UNFILLED`; includes fill/expired diagnostics.
+- Hourly digest includes ChurnDiagnostics, governor suspend reasons list, and micro tracked/pinned/interest clarity.
+
+5) Validation evidence
+- Compile checks passed.
+- Services restarted and verified running.
+- Forced Telegram digest sent successfully after deployment.
+
+6) Git traceability
+- Pending commit for this 16-issue unified wave.

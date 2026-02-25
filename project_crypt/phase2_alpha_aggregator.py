@@ -54,6 +54,12 @@ PHASE2_AUTOTUNER_MIN_N = int(os.getenv("PHASE2_AUTOTUNER_MIN_N", "40"))
 PHASE2_AUTOTUNER_MIN_SORTINO = float(os.getenv("PHASE2_AUTOTUNER_MIN_SORTINO", "0.25"))
 PHASE2_AUTOTUNER_P5_FLOOR = float(os.getenv("PHASE2_AUTOTUNER_P5_FLOOR", "-80"))
 
+CHURN_SYMBOL_FAIL_LIMIT_5M = int(os.getenv("CHURN_SYMBOL_FAIL_LIMIT_5M", "6"))
+CHURN_PENALTY_BOX_SEC = int(os.getenv("CHURN_PENALTY_BOX_SEC", "900"))
+CHURN_GLOBAL_PENALTY_SYMBOLS_LIMIT = int(os.getenv("CHURN_GLOBAL_PENALTY_SYMBOLS_LIMIT", "4"))
+CHURN_GLOBAL_WINDOW_MIN = int(os.getenv("CHURN_GLOBAL_WINDOW_MIN", "15"))
+CHURN_HOT_LOOP_MAX_IDENTICAL_5M = int(os.getenv("CHURN_HOT_LOOP_MAX_IDENTICAL_5M", "8"))
+
 
 class Source:
     CRYPTOCOM = "crypto.com"
@@ -306,6 +312,31 @@ def init_tables() -> None:
                 recommendation_json TEXT,
                 applied INTEGER NOT NULL,
                 reason TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS churn_event_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                attempt_id TEXT,
+                symbol TEXT,
+                event_class TEXT NOT NULL,
+                event_reason TEXT NOT NULL,
+                params_hash TEXT,
+                counted INTEGER NOT NULL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS symbol_penalty_box (
+                symbol TEXT PRIMARY KEY,
+                until_ts TEXT NOT NULL,
+                reason TEXT,
+                updated_ts TEXT NOT NULL
             )
             """
         )
@@ -1132,6 +1163,43 @@ def tradable_autotuner_stats(hours: int = 24) -> dict:
     return out
 
 
+def _churn_params_hash(symbol: str, reason: str, extras: dict | None = None) -> str:
+    raw = json.dumps({"symbol": symbol, "reason": reason, "extras": extras or {}}, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def log_churn_event(attempt_id: str, symbol: str, event_class: str, event_reason: str, counted: bool, extras: dict | None = None) -> None:
+    params_hash = _churn_params_hash(symbol, event_reason, extras)
+    with db() as c:
+        c.execute(
+            "insert into churn_event_log (ts,attempt_id,symbol,event_class,event_reason,params_hash,counted,details_json) values (?,?,?,?,?,?,?,?)",
+            (utc_now(), attempt_id, symbol, event_class, event_reason, params_hash, int(bool(counted)), json.dumps(extras or {}, default=str)),
+        )
+
+
+def in_penalty_box(symbol: str) -> bool:
+    now = datetime.now(timezone.utc)
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select until_ts from symbol_penalty_box where symbol=?", (symbol,))
+        r = cur.fetchone()
+        if not r:
+            return False
+        try:
+            return datetime.fromisoformat(str(r[0])) > now
+        except Exception:
+            return False
+
+
+def put_penalty_box(symbol: str, reason: str) -> None:
+    until = (datetime.now(timezone.utc) + timedelta(seconds=CHURN_PENALTY_BOX_SEC)).isoformat()
+    with db() as c:
+        c.execute(
+            "insert into symbol_penalty_box (symbol,until_ts,reason,updated_ts) values (?,?,?,?) on conflict(symbol) do update set until_ts=excluded.until_ts, reason=excluded.reason, updated_ts=excluded.updated_ts",
+            (symbol, until, reason, utc_now()),
+        )
+
+
 def _btc_1h_return_abs() -> float:
     try:
         d = get_json("https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name=BTC_USDT&timeframe=1h")
@@ -1258,26 +1326,44 @@ def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
         attempt_churn_limit = max(6, int(attempt_churn_limit * 0.7))
 
     since = (now - timedelta(minutes=window_minutes)).isoformat()
+    since_5m = (now - timedelta(minutes=5)).isoformat()
     since_24h = (now - timedelta(hours=24)).isoformat()
     with db() as c:
         cur = c.cursor()
-        # unique attempt churn in 15m buckets
-        cur.execute(
-            """
-            select count(*) from (
-              select coalesce(instrument_symbol,symbol) as ikey, substr(ts,1,16) as bucket
-              from universe_state
-              where ts>=? and status='ACTIONABLE'
-              group by ikey, bucket
-            )
-            """,
-            (since,),
-        )
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1", (since,))
         attempt_churn = int((cur.fetchone() or [0])[0] or 0)
-        cur.execute("select count(*) from ghost_sim_runs where ts>=?", (since,))
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='EXECUTION' and counted=1", (since,))
         execution_churn = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1", (since_5m,))
+        attempt_churn_5m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='EXECUTION' and counted=1", (since_5m,))
+        execution_churn_5m = int((cur.fetchone() or [0])[0] or 0)
+
         cur.execute("select net_pnl_bps from ghost_sim_runs where ts>=? order by id desc limit 60", (since_24h,))
         last_runs_24h = [float(r[0] or 0.0) for r in cur.fetchall()]
+
+        cur.execute("select symbol, count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by symbol having c>=?", (since_5m, CHURN_SYMBOL_FAIL_LIMIT_5M))
+        penalty_candidates = [str(r[0]) for r in cur.fetchall() if r[0]]
+        for sym in penalty_candidates:
+            put_penalty_box(sym, "attempt_churn_5m")
+
+        cur.execute("select count(*) from symbol_penalty_box where until_ts > ?", (now.isoformat(),))
+        unique_penalty_symbols = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("select symbol,event_reason,params_hash,count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by symbol,event_reason,params_hash order by c desc limit 1", (since_5m,))
+        hr = cur.fetchone()
+        hot_loop = bool(hr and int(hr[3] or 0) >= CHURN_HOT_LOOP_MAX_IDENTICAL_5M)
+        hot_loop_key = f"{hr[0]}:{hr[1]}:{hr[2]}" if hr else None
+
+        cur.execute("select event_reason,count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by event_reason order by c desc limit 6", (since,))
+        attempt_reasons_60m = {str(r[0]): int(r[1] or 0) for r in cur.fetchall()}
+        cur.execute("select event_reason,count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by event_reason order by c desc limit 6", (since_5m,))
+        attempt_reasons_5m = {str(r[0]): int(r[1] or 0) for r in cur.fetchall()}
+        cur.execute("select symbol,event_reason,params_hash,ts from churn_event_log where event_class='ATTEMPT' order by id desc limit 8")
+        last_attempt_events = [
+            {"symbol": str(r[0] or ''), "reason": str(r[1] or ''), "params_hash": str(r[2] or ''), "ts": str(r[3] or '')}
+            for r in cur.fetchall()
+        ]
 
     # Consecutive losses from latest execution-like outcomes
     consec_losses = 0
@@ -1297,9 +1383,15 @@ def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
     if prev.get("halted"):
         previous_halt_reason = prev.get("halt_reason")
 
-    if execution_churn >= execution_churn_limit:
+    if hot_loop:
+        halted = True
+        halt_reason = "RISK_HOT_LOOP"
+    elif execution_churn >= execution_churn_limit:
         halted = True
         halt_reason = "RISK_CHURN"
+    elif unique_penalty_symbols >= CHURN_GLOBAL_PENALTY_SYMBOLS_LIMIT:
+        halted = True
+        halt_reason = "RISK_ATTEMPT_CHURN_SYSTEMIC"
     elif consec_losses >= consec_loss_limit and execution_churn > 0:
         halted = True
         halt_reason = "RISK_CONSEC_LOSSES"
@@ -1346,6 +1438,16 @@ def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
             "consec_loss_limit": consec_loss_limit,
             "soft_throttle": soft_throttle,
             "macro_shock": bool(macro_shock),
+            "attempt_churn_5m": attempt_churn_5m,
+            "execution_churn_5m": execution_churn_5m,
+            "unique_penalty_symbols": unique_penalty_symbols,
+            "hot_loop": hot_loop,
+            "hot_loop_key": hot_loop_key,
+            "penalty_candidates": penalty_candidates,
+            "attempt_reasons_5m": attempt_reasons_5m,
+            "attempt_reasons_60m": attempt_reasons_60m,
+            "last_attempt_events": last_attempt_events,
+            "churn_telemetry_suspect": bool(execution_churn > max(1, attempt_churn * 2)),
         },
     }
 
@@ -1402,15 +1504,26 @@ def parameter_governor_recommend(summary: dict, autotuner_stats: dict, risk_stat
     downside_dev = (sum(x * x for x in downside) / max(1, len(downside))) ** 0.5
     sortino = mean / max(1e-6, downside_dev)
 
-    suspend = bool(shock or halted or p5 < PHASE2_AUTOTUNER_P5_FLOOR)
+    suspend_reasons = []
+    if shock:
+        suspend_reasons.append("SHOCK_ACTIVE")
+    if halted:
+        suspend_reasons.append("RISK_HALT")
+    if p5 < PHASE2_AUTOTUNER_P5_FLOOR:
+        suspend_reasons.append("TAIL_GATE_FAIL")
+
+    suspend = bool(suspend_reasons)
     stable = bool((summary.get("risk_pass_total", 0) or 0) > 0 and (summary.get("cost_pass_total", 0) or 0) > 0)
+    if not stable:
+        suspend_reasons.append("WINDOW_UNSTABLE")
     can_loosen = bool((not suspend) and stable and n >= PHASE2_AUTOTUNER_MIN_N and mean > 0 and sortino >= PHASE2_AUTOTUNER_MIN_SORTINO)
 
     rec = {
         "mode": "recommend_only" if not PHASE2_AUTOTUNER_APPLY else "apply_enabled",
         "namespace": "core",
         "suspended": suspend,
-        "suspend_reason": "macro_shock_or_halt_or_tail" if suspend else None,
+        "suspend_reasons": suspend_reasons,
+        "suspend_reason": ",".join(suspend_reasons) if suspend_reasons else None,
         "metrics": {
             "n": n,
             "mean": round(mean, 2),
@@ -1558,9 +1671,15 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
         t1, n1, w1 = cur.fetchone()
         cur.execute("select count(*), coalesce(sum(net_pnl_bps),0), coalesce(avg(case when net_pnl_bps>0 then 1.0 else 0.0 end),0) from bloodbath_ghost_runs where ts>=?", (since_24h,))
         t24, n24, w24 = cur.fetchone()
+        cur.execute("select count(*) from bloodbath_ghost_runs where ts>=? and execution_style='FILLED_MAKER'", (since_1h,))
+        filled_1h = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from bloodbath_ghost_runs where ts>=? and execution_style='EXPIRED_UNFILLED'", (since_1h,))
+        expired_1h = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select coalesce(avg(net_pnl_bps),0) from bloodbath_ghost_runs where ts>=? and execution_style='FILLED_MAKER'", (since_1h,))
+        pnl_cond_fill_1h = float((cur.fetchone() or [0])[0] or 0.0)
     out["attempts_hour"] = total_attempts
     out["attempts_by_symbol"] = attempts_by_symbol
-    out["ghost_1h"] = {"trades": int(t1 or 0), "net_pnl_bps": round(float(n1 or 0.0), 2), "winrate": round(float(w1 or 0.0), 3)}
+    out["ghost_1h"] = {"trades": int(t1 or 0), "net_pnl_bps": round(float(n1 or 0.0), 2), "winrate": round(float(w1 or 0.0), 3), "fill_rate": round((filled_1h / max(1, int(t1 or 0))), 3), "expired_rate": round((expired_1h / max(1, int(t1 or 0))), 3), "pnl_conditional_on_fill": round(pnl_cond_fill_1h, 2)}
     out["ghost_24h"] = {"trades": int(t24 or 0), "net_pnl_bps": round(float(n24 or 0.0), 2), "winrate": round(float(w24 or 0.0), 3)}
 
     # daily lane DD guard
@@ -1601,9 +1720,14 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
     for cand in candidates:
         sym = cand["symbol"]
         inst = cand["instrument_symbol"]
+        attempt_id = f"BB-{sym}-{int(time.time()*1000)}-{random.randint(100,999)}"
         if total_attempts >= max_attempts_hour:
             break
         if attempts_by_symbol.get(sym, 0) >= max_attempts_symbol:
+            log_churn_event(attempt_id, sym, "ATTEMPT", "SYMBOL_ATTEMPT_CAP", False, {"cap": max_attempts_symbol})
+            continue
+        if in_penalty_box(sym):
+            log_churn_event(attempt_id, sym, "ATTEMPT", "PENALTY_BOX_BLOCK", False, {})
             continue
         if consec_losses >= BLOODBATH_LANE_CONSEC_LOSS_LIMIT:
             out["active"] = False
@@ -1613,10 +1737,12 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             cd = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
             rows = cd.get("result", {}).get("data", []) if isinstance(cd, dict) else []
             if len(rows) < 3:
+                log_churn_event(attempt_id, sym, "ATTEMPT", "STALE_BOOK_ABORT", True, {"rows": len(rows)})
                 continue
             entry = float(rows[-2].get("o") or 0.0)
             exitp = float(rows[-1].get("c") or 0.0)
             if entry <= 0 or exitp <= 0:
+                log_churn_event(attempt_id, sym, "ATTEMPT", "PRICE_CHASE_ABORT", True, {"entry": entry, "exit": exitp})
                 continue
             m = micro_latest.get(sym, {})
             spread = float(m.get("spread_bps_p95_300", 20.0) or 20.0)
@@ -1632,8 +1758,8 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             pnl_bps = ((exitp - entry) / entry) * 10000.0
             net = (p_fill * pnl_bps) - exp_cost
             if expired_unfilled:
-                net = -0.2  # slight opportunity-cost penalty
-            exec_style = "EXPIRED_UNFILLED" if expired_unfilled else "maker-first"
+                net = 0.0
+            exec_style = "EXPIRED_UNFILLED" if expired_unfilled else "FILLED_MAKER"
             with db() as c:
                 c.execute(
                     """
@@ -1645,11 +1771,17 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             attempts_by_symbol[sym] = attempts_by_symbol.get(sym, 0) + 1
             total_attempts += 1
             attempts_made += 1
-            if net < 0:
-                consec_losses += 1
+            if expired_unfilled:
+                log_churn_event(attempt_id, sym, "ATTEMPT", "EXPIRED_UNFILLED", True, {"p_fill": p_fill})
             else:
+                log_churn_event(attempt_id, sym, "ATTEMPT", "FILLED_MAKER", True, {"p_fill": p_fill})
+                log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": net})
+            if net < 0 and not expired_unfilled:
+                consec_losses += 1
+            elif not expired_unfilled:
                 consec_losses = 0
-        except Exception:
+        except Exception as e:
+            log_churn_event(attempt_id, sym, "ATTEMPT", "VENUE_ERROR", True, {"error": str(e)[:160]})
             continue
 
     next_state = {
@@ -2273,6 +2405,14 @@ def run_cycle() -> dict:
     dex_join = len([s for s in eligible_syms if s in dex_latest or s in dex_boosted])
     denom = max(1, len(eligible_syms))
     micro_target_k = int(os.getenv("MICRO_TOP_SYMBOLS", "150"))
+    micro_pinned_total = 0
+    micro_interest_total = 0
+    try:
+        mu = json.loads(Path("/home/itachi/.openclaw/workspace/project_crypt/micro_universe_state.json").read_text())
+        micro_pinned_total = len(mu.get("pinned_symbols", []) or [])
+        micro_interest_total = len(mu.get("interest_symbols", []) or [])
+    except Exception:
+        pass
     sanity = {
         "micro_target_k": micro_target_k,
         "pre_cost_skip_breakdown": dict(pre_cost_skip),
@@ -2282,6 +2422,9 @@ def run_cycle() -> dict:
         "duplicates_removed": duplicates_removed,
         "invalid_assets_filtered": invalid_assets_filtered,
         "micro_present": len(micro_latest),
+        "micro_tracked_total": len(micro_latest),
+        "micro_pinned_total": micro_pinned_total,
+        "micro_interest_total": micro_interest_total,
         "join_rate_to_eligible": {
             "micro": round(micro_join / denom, 3),
             "defillama": round(llama_join / denom, 3),

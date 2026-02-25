@@ -338,7 +338,8 @@ def hourly_summary() -> str:
     bloodbath_line = "LaneActive=False reason=- attempts_hour=0"
     bloodbath_candidates_line = "none"
     bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
-    governor_line = "mode=recommend_only suspended=True reason=- n=0"
+    governor_line = "mode=recommend_only suspended=True reasons=[] n=0"
+    churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
     sources_present_txt = "{}"
 
     if funnel:
@@ -355,7 +356,9 @@ def hourly_summary() -> str:
             sj = {}
         micro_cov_line = (
             f"micro_target_K={sj.get('micro_target_k', 0)} "
-            f"micro_tracked_count={sj.get('micro_present', 0)} "
+            f"micro_tracked_total={sj.get('micro_tracked_total', sj.get('micro_present', 0))} "
+            f"micro_pinned_total={sj.get('micro_pinned_total', 0)} "
+            f"micro_interest_total={sj.get('micro_interest_total', 0)} "
             f"eligible_unique={sj.get('eligible_unique', 0)} "
             f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
             f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
@@ -383,14 +386,22 @@ def hourly_summary() -> str:
         g24 = bb.get('ghost_24h', {}) or {}
         bloodbath_ghost_line = (
             f"1h:trades={int(g1.get('trades', 0) or 0)} net={float(g1.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g1.get('winrate', 0.0) or 0.0):.2f}"
+            f" fill={float(g1.get('fill_rate', 0.0) or 0.0):.2f} expired={float(g1.get('expired_rate', 0.0) or 0.0):.2f} cond_fill_pnl={float(g1.get('pnl_conditional_on_fill', 0.0) or 0.0):.1f}"
             f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
         )
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         governor_line = (
             f"mode={gov.get('mode','recommend_only')} suspended={bool(gov.get('suspended', True))} "
-            f"reason={gov.get('suspend_reason') or '-'} n={int(gm.get('n', 0) or 0)} "
+            f"reasons={gov.get('suspend_reasons', [])} n={int(gm.get('n', 0) or 0)} "
             f"mean={float(gm.get('mean', 0.0) or 0.0):.1f} p5={float(gm.get('p5', 0.0) or 0.0):.1f}"
+        )
+        rd = rs.get('details', {}) or {}
+        churn_diag_line = (
+            f"attempt5m={int(rd.get('attempt_churn_5m', 0) or 0)} attempt60m={int(rs.get('attempt_churn_count', 0) or 0)} "
+            f"exec5m={int(rd.get('execution_churn_5m', 0) or 0)} exec60m={int(rs.get('execution_churn_count', 0) or 0)} "
+            f"penalty_symbols={int(rd.get('unique_penalty_symbols', 0) or 0)} hot_loop={bool(rd.get('hot_loop', False))} "
+            f"suspect={bool(rd.get('churn_telemetry_suspect', False))}"
         )
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
@@ -439,6 +450,7 @@ def hourly_summary() -> str:
         f"BloodbathCandidatesTop: {bloodbath_candidates_line}\n"
         f"BloodbathGhost: {bloodbath_ghost_line}\n"
         f"ParameterGovernor: {governor_line}\n"
+        f"ChurnDiagnostics: {churn_diag_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
