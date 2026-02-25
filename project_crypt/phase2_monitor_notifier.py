@@ -27,20 +27,20 @@ def _safe_ratio(num: float, den: float) -> float:
     return num / den
 
 
-def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
+def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: str) -> tuple[str, str, str]:
     cur.execute(
         """
         select discovered_total,mapped_to_venue_total,eligible_total,actionable_total,alpha_scored_total,cost_evaluated_total,cost_pass_total,risk_evaluated_total,risk_pass_total
         from candidate_funnel_log
         where ts >= ?
         order by id desc
-        limit 72
+        limit ?
         """,
-        (since_6h,),
+        (since_ts, limit),
     )
     rows = cur.fetchall()
     if not rows:
-        return "none", "no-funnel-data"
+        return f"{label}:none", "none", "no-funnel-data"
 
     discovered = sum(int(r["discovered_total"] or 0) for r in rows)
     mapped = sum(int(r["mapped_to_venue_total"] or 0) for r in rows)
@@ -73,11 +73,11 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_6h: str) -> tuple[str, str]:
     }[bottleneck_stage]
 
     analysis_txt = (
-        f"6h_step_rates scored->costed={r_scored_to_costed:.2f} costed->cost_pass={r_costed_to_costpass:.2f} "
+        f"{label}_step_rates scored->costed={r_scored_to_costed:.2f} costed->cost_pass={r_costed_to_costpass:.2f} "
         f"cost_pass->risk_pass={r_costpass_to_riskpass:.2f} risk_pass->actionable={r_riskpass_to_actionable:.2f}; "
         f"bottleneck={bottleneck_stage}"
     )
-    return analysis_txt, recommendation
+    return analysis_txt, bottleneck_stage, recommendation
 
 
 def hourly_summary() -> str:
@@ -252,7 +252,8 @@ def hourly_summary() -> str:
         )
         ghost_rows = cur.fetchall()
 
-        periodic_analysis_txt, periodic_reco = _periodic_analysis(cur, since_6h)
+        periodic_analysis_txt_6h, bottleneck_6h, periodic_reco = _periodic_analysis(cur, since_6h, 72, "6h")
+    periodic_analysis_txt_1h, bottleneck_1h, _ = _periodic_analysis(cur, since, 24, "1h")
 
     eligible = [r for r in top if r["status"] == "ELIGIBLE"]
     watch = [r for r in top if r["status"] == "WATCH"]
@@ -319,8 +320,11 @@ def hourly_summary() -> str:
     micro_cov_line = "none"
     pre_cost_line = "none"
     util_line = "none"
-    risk_codes_line = "none"
-    safety_line = "none"
+    risk_codes_line = "{}"
+    safety_line = "base=0.0,regime=0.0,uncertainty=0.0"
+    risk_state_line = "halted=False reason=- churn=0 consec=0 cooldown=0s window=60m"
+    churn_basis_line = "churn_basis=ACTIONABLE_ATTEMPTS"
+    macro_line = "macro_shock=False"
     sources_present_txt = "{}"
 
     if funnel:
@@ -345,6 +349,15 @@ def hourly_summary() -> str:
         pre_cost_line = str(sj.get('pre_cost_skip_breakdown', {}))
         util_line = str(sj.get('avg_notional_utilization', 0))
         risk_codes_line = str(sj.get('risk_reason_codes', {}))
+        rs = sj.get('risk_state', {}) or {}
+        risk_state_line = (
+            f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} "
+            f"churn={int(rs.get('churn_count', 0) or 0)} consec={int(rs.get('consecutive_losses', 0) or 0)} "
+            f"cooldown={int(rs.get('cooldown_seconds_remaining', 0) or 0)}s window={int(rs.get('window_minutes', 60) or 60)}m"
+        )
+        churn_basis_line = f"churn_basis={rs.get('churn_basis', 'ACTIONABLE_ATTEMPTS')}"
+        m = sj.get('macro_shock', {}) or {}
+        macro_line = f"macro_shock={bool(m.get('macro_shock', False))} btc_1h_abs={m.get('btc_ret_1h_abs', 0)} news_velocity={m.get('news_velocity', 0)}"
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
     cliff_hint = "none"
@@ -379,6 +392,9 @@ def hourly_summary() -> str:
         f"PreCostSkipBreakdown: {pre_cost_line}\n"
         f"AvgNotionalUtilization(actionable): {util_line}\n"
         f"MicroStats: {regime_line}\n"
+        f"RiskState: {risk_state_line}\n"
+        f"RiskChurnBasis: {churn_basis_line}\n"
+        f"MacroShock: {macro_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
@@ -393,7 +409,10 @@ def hourly_summary() -> str:
         f"Micro widest spreads: {widest_txt}\n"
         f"Micro best liquidity: {best_liq_txt}\n"
         f"Examples: {ex_txt}\n"
-        f"Periodic analysis: {periodic_analysis_txt}\n"
+        f"Bottleneck(1h): {bottleneck_1h}\n"
+        f"Bottleneck(6h): {bottleneck_6h}\n"
+        f"Periodic analysis (1h): {periodic_analysis_txt_1h}\n"
+        f"Periodic analysis (6h): {periodic_analysis_txt_6h}\n"
         f"Recommended focus: {periodic_reco}"
     )
 
@@ -424,6 +443,16 @@ def seconds_until_next_hour_sgt() -> int:
     return max(1, int((next_hour - now).total_seconds()))
 
 
+def _send_hourly_with_fallback(tg: TelegramNotifier, text: str) -> bool:
+    ok = bool(tg.send(text))
+    if ok:
+        return True
+    compact = text
+    if len(compact) > 3400:
+        compact = compact[:3400] + "\n...[truncated for telegram safety]"
+    return bool(tg.send(compact))
+
+
 def main() -> None:
     tg = TelegramNotifier()
     _append_log("notifier_start")
@@ -434,7 +463,7 @@ def main() -> None:
         _append_log(f"sleep_until_next_hour_s={sleep_s}")
         time.sleep(sleep_s)
         try:
-            ok = bool(tg.send(hourly_summary()))
+            ok = _send_hourly_with_fallback(tg, hourly_summary())
             _append_log(f"hourly_send_ok={ok}")
             _write_heartbeat(ok=ok, error=None if ok else "send_returned_false")
         except Exception as e:

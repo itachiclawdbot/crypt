@@ -208,6 +208,23 @@ def init_tables() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_state_current (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                ts TEXT NOT NULL,
+                halted INTEGER NOT NULL,
+                halt_reason TEXT,
+                churn_basis TEXT,
+                churn_count INTEGER NOT NULL,
+                consecutive_losses INTEGER NOT NULL,
+                cooldown_seconds_remaining INTEGER NOT NULL,
+                cooldown_until TEXT,
+                window_minutes INTEGER NOT NULL,
+                details_json TEXT
+            )
+            """
+        )
         _ensure_column(c, "candidate_funnel_log", "watch_total", "INTEGER")
         _ensure_column(c, "candidate_funnel_log", "actionable_total", "INTEGER")
         _ensure_column(c, "candidate_funnel_log", "alpha_scored_total", "INTEGER")
@@ -998,6 +1015,164 @@ def tradable_autotuner_stats(hours: int = 24) -> dict:
     return out
 
 
+def _btc_1h_return_abs() -> float:
+    try:
+        d = get_json("https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name=BTC_USDT&timeframe=1h")
+        rows = d.get("result", {}).get("data", []) if isinstance(d, dict) else []
+        if len(rows) < 3:
+            return 0.0
+        prev = float(rows[-2].get("c") or 0.0)
+        curr = float(rows[-1].get("c") or 0.0)
+        if prev <= 0 or curr <= 0:
+            return 0.0
+        return abs((curr - prev) / prev)
+    except Exception:
+        return 0.0
+
+
+def detect_macro_shock(regime: str, news_hits: int, venue_metrics: dict[str, dict]) -> dict:
+    btc_ret_1h_abs = _btc_1h_return_abs()
+    moves = [abs(float(v.get("chg_24h_abs", 0.0))) for v in venue_metrics.values() if v]
+    median_move = _percentile(moves, 0.5, 0.0)
+    shock = bool(regime == "VOLATILE" or btc_ret_1h_abs >= 0.02 or median_move >= 0.08 or news_hits >= 12)
+    return {
+        "macro_shock": shock,
+        "btc_ret_1h_abs": round(btc_ret_1h_abs, 5),
+        "median_abs_move_24h": round(float(median_move), 5),
+        "news_velocity": int(news_hits),
+    }
+
+
+def load_risk_state() -> dict:
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json from risk_state_current where id=1")
+        r = cur.fetchone()
+        if not r:
+            return {
+                "halted": False,
+                "halt_reason": None,
+                "churn_basis": "ACTIONABLE_ATTEMPTS",
+                "churn_count": 0,
+                "consecutive_losses": 0,
+                "cooldown_seconds_remaining": 0,
+                "cooldown_until": None,
+                "window_minutes": 60,
+                "details": {},
+            }
+        return {
+            "halted": bool(r[0]),
+            "halt_reason": r[1],
+            "churn_basis": r[2] or "ACTIONABLE_ATTEMPTS",
+            "churn_count": int(r[3] or 0),
+            "consecutive_losses": int(r[4] or 0),
+            "cooldown_seconds_remaining": int(r[5] or 0),
+            "cooldown_until": r[6],
+            "window_minutes": int(r[7] or 60),
+            "details": json.loads(r[8] or "{}"),
+        }
+
+
+def compute_shadow_risk_state() -> dict:
+    now = datetime.now(timezone.utc)
+    window_minutes = int(os.getenv("PHASE2_RISK_WINDOW_MIN", "60"))
+    cooldown_sec = int(os.getenv("PHASE2_RISK_COOLDOWN_SEC", "3600"))
+    churn_limit = int(os.getenv("PHASE2_RISK_CHURN_LIMIT", "18"))
+    consec_loss_limit = int(os.getenv("PHASE2_RISK_CONSEC_LOSS_LIMIT", "8"))
+    since = (now - timedelta(minutes=window_minutes)).isoformat()
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select count(*) from universe_state where ts>=? and status='ACTIONABLE'", (since,))
+        actionable_attempts = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from ghost_sim_runs where ts>=?", (since,))
+        ghost_exec = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select net_pnl_bps from ghost_sim_runs order by id desc limit 30")
+        last_runs = [float(r[0] or 0.0) for r in cur.fetchall()]
+
+    consec_losses = 0
+    for pnl in last_runs:
+        if pnl < 0:
+            consec_losses += 1
+        else:
+            break
+
+    churn_count = actionable_attempts + ghost_exec
+    halt_reason = None
+    halted = False
+    if churn_count >= churn_limit:
+        halted = True
+        halt_reason = "RISK_CHURN"
+    elif consec_losses >= consec_loss_limit and ghost_exec > 0:
+        halted = True
+        halt_reason = "RISK_CONSEC_LOSSES"
+
+    prev = load_risk_state()
+    cooldown_until = prev.get("cooldown_until")
+    if halted:
+        cooldown_until = (now + timedelta(seconds=cooldown_sec)).isoformat()
+    elif prev.get("halted") and cooldown_until:
+        try:
+            remain = int((datetime.fromisoformat(cooldown_until) - now).total_seconds())
+            if remain > 0:
+                halted = True
+                halt_reason = prev.get("halt_reason") or "RISK_COOLDOWN"
+        except Exception:
+            pass
+
+    cooldown_remaining = 0
+    if cooldown_until:
+        try:
+            cooldown_remaining = max(0, int((datetime.fromisoformat(cooldown_until) - now).total_seconds()))
+        except Exception:
+            cooldown_remaining = 0
+
+    state = {
+        "halted": bool(halted),
+        "halt_reason": halt_reason,
+        "churn_basis": "ACTIONABLE_ATTEMPTS",
+        "churn_count": int(churn_count),
+        "consecutive_losses": int(consec_losses),
+        "cooldown_seconds_remaining": int(cooldown_remaining),
+        "cooldown_until": cooldown_until,
+        "window_minutes": window_minutes,
+        "details": {
+            "actionable_attempts": actionable_attempts,
+            "ghost_exec": ghost_exec,
+            "churn_limit": churn_limit,
+            "consec_loss_limit": consec_loss_limit,
+        },
+    }
+
+    with db() as c:
+        c.execute(
+            """
+            insert into risk_state_current (id,ts,halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json)
+            values (1,?,?,?,?,?,?,?,?,?,?)
+            on conflict(id) do update set
+              ts=excluded.ts, halted=excluded.halted, halt_reason=excluded.halt_reason,
+              churn_basis=excluded.churn_basis, churn_count=excluded.churn_count,
+              consecutive_losses=excluded.consecutive_losses,
+              cooldown_seconds_remaining=excluded.cooldown_seconds_remaining,
+              cooldown_until=excluded.cooldown_until,
+              window_minutes=excluded.window_minutes,
+              details_json=excluded.details_json
+            """,
+            (
+                utc_now(),
+                int(state["halted"]),
+                state["halt_reason"],
+                state["churn_basis"],
+                state["churn_count"],
+                state["consecutive_losses"],
+                state["cooldown_seconds_remaining"],
+                state["cooldown_until"],
+                state["window_minutes"],
+                json.dumps(state["details"], default=str),
+            ),
+        )
+    return state
+
+
 def run_ghost_simulator() -> dict:
     since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     rows_done = 0
@@ -1094,6 +1269,8 @@ def run_cycle() -> dict:
     regime = classify_regime(venue_metrics, micro_latest)
     obi_threshold = obi_threshold_for_regime(regime)
     pressure_count = 0
+    macro = detect_macro_shock(regime, news_hits, venue_metrics)
+    risk_state = compute_shadow_risk_state()
 
     alpha_scored_count = 0
     cost_evaluated_count = 0
@@ -1424,8 +1601,10 @@ def run_cycle() -> dict:
                     risk_evaluated_count += 1
 
                     risk_reason_code = None
-                    if confidence < min_conf:
-                        risk_reason_code = "RISK_CHURN"
+                    if risk_state.get("halted"):
+                        risk_reason_code = "RISK_GLOBAL_HALT"
+                    elif confidence < min_conf:
+                        risk_reason_code = "RISK_CONFIDENCE_LOW"
                     else:
                         with db() as _c:
                             _cur = _c.cursor()
@@ -1433,14 +1612,10 @@ def run_cycle() -> dict:
                             hourly_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
                             _cur.execute("select avg(net_pnl_bps) from ghost_sim_runs where ts >= datetime('now','-24 hours')")
                             daily_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
-                            _cur.execute("select count(*) from ghost_sim_runs where ts >= datetime('now','-6 hours') and net_pnl_bps < 0")
-                            consec_losses = int((_cur.fetchone() or [0])[0] or 0)
                         if daily_pnl <= -40:
                             risk_reason_code = "RISK_DD_DAILY"
                         elif hourly_pnl <= -20:
                             risk_reason_code = "RISK_DD_HOURLY"
-                        elif consec_losses >= 8:
-                            risk_reason_code = "RISK_CONSEC_LOSSES"
 
                     if risk_reason_code:
                         deny_stage = "risk"
@@ -1448,8 +1623,10 @@ def run_cycle() -> dict:
                         deny_reason = risk_reason_code
                         reject_counter[deny_reason] += 1
                         rejects_tradable["risk"] += 1
-                        risk_code_counter[deny_reason] += 1
-                        log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf, "regime": regime})
+                        risk_code_counter[risk_state.get("halt_reason") if risk_reason_code == "RISK_GLOBAL_HALT" else deny_reason] += 1
+                        if risk_reason_code != "RISK_GLOBAL_HALT":
+                            log_reject(sym, deny_stage, deny_reason, {"confidence": confidence, "min_conf": min_conf, "regime": regime})
+                        status = "BLOCKED_BY_RISK" if risk_reason_code == "RISK_GLOBAL_HALT" else status
                     else:
                         risk_pass_count += 1
                         proposed_count += 1
@@ -1549,7 +1726,7 @@ def run_cycle() -> dict:
         deduped[k] = row
     all_rows = list(deduped.values())
 
-    watch_rows = [x for x in all_rows if x["status"] == "WATCH"]
+    watch_rows = [x for x in all_rows if x["status"] in {"WATCH", "BLOCKED_BY_RISK"}]
     eligible_rows = [x for x in all_rows if x["status"] == "ELIGIBLE"]
     actionable_rows = [x for x in all_rows if x["status"] == "ACTIONABLE"]
 
@@ -1583,6 +1760,9 @@ def run_cycle() -> dict:
         },
         "micro_join_fail": micro_join_fail,
         "risk_reason_codes": dict(risk_code_counter),
+        "risk_state": risk_state,
+        "macro_shock": macro,
+        "autotuner_frozen": bool(macro.get("macro_shock")),
     }
 
     log_funnel(
@@ -1608,6 +1788,9 @@ def run_cycle() -> dict:
             "cost_fail_breakdown": dict(cost_fail_breakdown),
             "autotuner_tradable": autotuner_stats,
             "pressure_count": pressure_count,
+            "risk_state": risk_state,
+            "macro_shock": macro,
+            "autotuner_frozen": bool(macro.get("macro_shock")),
         },
     )
 
@@ -1647,6 +1830,9 @@ def run_cycle() -> dict:
         "sanity": sanity,
         "cost_fail_breakdown": dict(cost_fail_breakdown),
         "autotuner_tradable": autotuner_stats,
+        "autotuner_frozen": bool(macro.get("macro_shock")),
+        "risk_state": risk_state,
+        "macro_shock": macro,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
         "defillama_symbols_total": len(llama_syms),
@@ -1702,8 +1888,11 @@ def main() -> None:
                 tg.send(build_startup_ping(summary))
                 startup_ping_sent = True
             if time.time() - last_ghost_run >= 3600:
-                ghost = run_ghost_simulator()
-                put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
+                if bool((summary.get("macro_shock") or {}).get("macro_shock", False)):
+                    put_signal(None, Source.SYSTEM, "ghost_sim_hourly_skipped", {"reason": "macro_shock"})
+                else:
+                    ghost = run_ghost_simulator()
+                    put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
                 last_ghost_run = time.time()
             write_status({
                 "state": "cycle_complete",

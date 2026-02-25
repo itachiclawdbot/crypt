@@ -500,3 +500,43 @@ Operational rule:
 
 6) Git traceability
 - Pending commit in `phase2-working` for notifier resilience changes.
+
+---
+
+## 2026-02-25 Risk Halt + Shock Awareness fix wave (shadow mode)
+1) Decision change summary
+- Fixed persistent risk-halt behavior by moving churn semantics to execution-like basis only.
+- Added explicit global `RiskState` so risk halts are represented once as system state rather than symbol-specific spam.
+- Added lightweight macro shock detection and freeze path for tuning-like updates during shock windows.
+- Hardened notifier delivery to avoid missed hourlies caused by oversized message payloads.
+
+2) Routing/flow impact
+- Risk evaluation now checks `RiskState` first at cost-pass stage; when halted, candidates become `BLOCKED_BY_RISK` with global reason (`RISK_GLOBAL_HALT`) instead of per-symbol pseudo-specific churn/loss spam.
+- Churn basis is now `ACTIONABLE_ATTEMPTS (+ ghost executions)` only.
+- Ghost simulator hourly updates are skipped during macro shock windows (`ghost_sim_hourly_skipped` signal).
+
+3) Data-structure/schema impact
+- Added new table: `risk_state_current` (single-row persisted global risk machine).
+- Added `risk_state`, `macro_shock`, `autotuner_frozen` into cycle sanity/summary payloads (stored in `candidate_funnel_log.sanity_json` and status summary).
+- Added notifier heartbeat/guard artifacts previously:
+  - `phase2_notifier_heartbeat.json`
+  - `phase2_notifier_guard.log`
+
+4) Runtime/ops impact
+- `phase2_alpha_aggregator.py` now computes and persists global risk state each cycle.
+- `phase2_monitor_notifier.py` now reports:
+  - RiskState line (halted/reason/churn/consec/cooldown/window)
+  - churn basis line
+  - macro shock line
+  - both 1h and 6h bottleneck lines
+  - SafetyBreakdown defaults always numeric (no `none` blind spots)
+- Notifier send path now retries with truncated payload fallback when message size exceeds Telegram practical limits.
+
+5) Validation evidence
+- Python compile checks passed for aggregator + notifier.
+- Services confirmed running after restart via watchdog.
+- Forced Telegram send succeeded after fallback (`send_ok=True`) with long hourly payload.
+- Watchdog and notifier guard cron remain active.
+
+6) Git traceability
+- Pending commit in `phase2-working` for this risk/shock/notifier wave.
