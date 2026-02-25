@@ -540,3 +540,40 @@ Operational rule:
 
 6) Git traceability
 - Pending commit in `phase2-working` for this risk/shock/notifier wave.
+
+---
+
+## 2026-02-25 Bloodbath Lane wave (majors-only shock lane + maker realism + ghost scoreboard)
+1) Decision change summary
+- Added isolated `BLOODBATH_LANE` (shadow-first) for panic-bounce capture in macro shock / volatile conditions.
+- Added lane-level risk isolation and cooldown behavior, without weakening global RiskState.
+- Added dedicated bloodbath ghost simulation records + hourly lane scoreboard metrics.
+
+2) Routing/flow impact
+- Lane activation uses `macro_shock || regime==VOLATILE` plus hysteresis (`BLOODBATH_HYSTERESIS_SEC`).
+- Lane hard-stands-down when global RiskState halted.
+- Candidate universe restricted to majors allowlist (`BLOODBATH_SYMBOL_ALLOWLIST`).
+- Candidate gate requires pressure-confidence + spread-stability + spread cap + depth-utilization.
+
+3) Data-structure/schema impact
+- New table `bloodbath_ghost_runs`:
+  - ts, symbol, lane, entry/exit, net_pnl_bps, execution_style, utilization, regime, macro_shock, fill/cost fields.
+- New table `bloodbath_lane_state`:
+  - active, reason, hysteresis/cooldown times, consecutive losses, attempts counters.
+- Existing summary/sanity payload now includes `bloodbath_lane` section.
+
+4) Runtime/ops impact
+- `phase2_alpha_aggregator.py` now computes/runs `run_bloodbath_lane(...)` each cycle.
+- Lane-specific guards:
+  - attempts per symbol/hour and total attempts/hour,
+  - lane consecutive loss limit + cooldown,
+  - daily lane drawdown cap (shadow).
+- Maker-first realism in lane simulation uses `p_fill_maker` and maker time budget with fallback expected cost.
+
+5) Validation evidence
+- Python compile checks passed.
+- Services restarted and confirmed running.
+- Forced Telegram send succeeded after this wave (`telegram_send_ok True`).
+
+6) Git traceability
+- Pending commit in `phase2-working` for Bloodbath Lane implementation.

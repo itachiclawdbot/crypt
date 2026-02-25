@@ -33,6 +33,21 @@ LISTING_STATE_PATH = os.getenv("PHASE2_LISTING_STATE_PATH", "/home/itachi/.openc
 DUNE_API_KEY = os.getenv("DUNE_API_KEY")
 DUNE_QUERY_IDS = [x.strip() for x in (os.getenv("DUNE_QUERY_IDS") or "").split(",") if x.strip()]
 
+BLOODBATH_ENABLED = str(os.getenv("BLOODBATH_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+BLOODBATH_SYMBOL_ALLOWLIST = [x.strip().upper() for x in os.getenv("BLOODBATH_SYMBOL_ALLOWLIST", "BTC_USDT,ETH_USDT,SOL_USDT").split(",") if x.strip()]
+BLOODBATH_PRESSURE_CONF_MIN = float(os.getenv("BLOODBATH_PRESSURE_CONF_MIN", "0.60"))
+BLOODBATH_SPREAD_MAX_BPS = float(os.getenv("BLOODBATH_SPREAD_MAX_BPS", "35"))
+BLOODBATH_MIN_UTILIZATION = float(os.getenv("BLOODBATH_MIN_UTILIZATION", "0.35"))
+BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR = int(os.getenv("BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR", "1"))
+BLOODBATH_MAX_ATTEMPTS_PER_HOUR = int(os.getenv("BLOODBATH_MAX_ATTEMPTS_PER_HOUR", "3"))
+BLOODBATH_LANE_RISK_FRACTION = float(os.getenv("BLOODBATH_LANE_RISK_FRACTION", "0.001"))
+BLOODBATH_LANE_CONSEC_LOSS_LIMIT = int(os.getenv("BLOODBATH_LANE_CONSEC_LOSS_LIMIT", "2"))
+BLOODBATH_LANE_COOLDOWN_SEC = int(os.getenv("BLOODBATH_LANE_COOLDOWN_SEC", "7200"))
+BLOODBATH_MAKER_TIME_BUDGET_SEC = int(os.getenv("BLOODBATH_MAKER_TIME_BUDGET_SEC", "35"))
+BLOODBATH_GHOST_EXIT_HORIZON_SEC = int(os.getenv("BLOODBATH_GHOST_EXIT_HORIZON_SEC", "900"))
+BLOODBATH_DD_LIMIT_BPS_DAY = float(os.getenv("BLOODBATH_DD_LIMIT_BPS_DAY", "80"))
+BLOODBATH_HYSTERESIS_SEC = int(os.getenv("BLOODBATH_HYSTERESIS_SEC", "3600"))
+
 
 class Source:
     CRYPTOCOM = "crypto.com"
@@ -221,6 +236,44 @@ def init_tables() -> None:
                 cooldown_seconds_remaining INTEGER NOT NULL,
                 cooldown_until TEXT,
                 window_minutes INTEGER NOT NULL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bloodbath_ghost_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                entry_ts TEXT,
+                exit_ts TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                net_pnl_bps REAL,
+                execution_style TEXT,
+                utilization REAL,
+                regime TEXT,
+                macro_shock INTEGER,
+                p_fill_maker REAL,
+                maker_time_budget_sec INTEGER,
+                costs_bps REAL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bloodbath_lane_state (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                ts TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                active_reason TEXT,
+                active_until TEXT,
+                cooldown_until TEXT,
+                consecutive_losses INTEGER NOT NULL,
+                attempts_hour INTEGER NOT NULL,
                 details_json TEXT
             )
             """
@@ -1173,6 +1226,226 @@ def compute_shadow_risk_state() -> dict:
     return state
 
 
+def load_bloodbath_lane_state() -> dict:
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select active,active_reason,active_until,cooldown_until,consecutive_losses,attempts_hour,details_json from bloodbath_lane_state where id=1")
+        r = cur.fetchone()
+        if not r:
+            return {
+                "active": False,
+                "active_reason": "disabled",
+                "active_until": None,
+                "cooldown_until": None,
+                "consecutive_losses": 0,
+                "attempts_hour": 0,
+                "details": {},
+            }
+        return {
+            "active": bool(r[0]),
+            "active_reason": r[1] or "disabled",
+            "active_until": r[2],
+            "cooldown_until": r[3],
+            "consecutive_losses": int(r[4] or 0),
+            "attempts_hour": int(r[5] or 0),
+            "details": json.loads(r[6] or "{}"),
+        }
+
+
+def save_bloodbath_lane_state(st: dict) -> None:
+    with db() as c:
+        c.execute(
+            """
+            insert into bloodbath_lane_state (id,ts,active,active_reason,active_until,cooldown_until,consecutive_losses,attempts_hour,details_json)
+            values (1,?,?,?,?,?,?,?,?)
+            on conflict(id) do update set
+              ts=excluded.ts, active=excluded.active, active_reason=excluded.active_reason,
+              active_until=excluded.active_until, cooldown_until=excluded.cooldown_until,
+              consecutive_losses=excluded.consecutive_losses, attempts_hour=excluded.attempts_hour,
+              details_json=excluded.details_json
+            """,
+            (
+                utc_now(),
+                int(bool(st.get("active", False))),
+                st.get("active_reason"),
+                st.get("active_until"),
+                st.get("cooldown_until"),
+                int(st.get("consecutive_losses", 0) or 0),
+                int(st.get("attempts_hour", 0) or 0),
+                json.dumps(st.get("details", {}), default=str),
+            ),
+        )
+
+
+def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics: dict[str, dict], micro_latest: dict[str, dict], base_to_instrument: dict[str, str | None]) -> dict:
+    now = datetime.now(timezone.utc)
+    lane_state = load_bloodbath_lane_state()
+    out = {
+        "active": False,
+        "reason": "disabled",
+        "attempts_hour": 0,
+        "attempts_by_symbol": {},
+        "candidates_top": [],
+        "ghost_1h": {"trades": 0, "net_pnl_bps": 0.0, "winrate": 0.0},
+        "ghost_24h": {"trades": 0, "net_pnl_bps": 0.0, "winrate": 0.0},
+    }
+    if not BLOODBATH_ENABLED:
+        out["reason"] = "BLOODBATH_DISABLED"
+        return out
+    if risk_state.get("halted"):
+        out["reason"] = "GLOBAL_RISK_HALTED"
+        return out
+
+    is_shock = bool(macro.get("macro_shock", False) or regime == "VOLATILE")
+    active_until = lane_state.get("active_until")
+    active_hysteresis = False
+    if active_until:
+        try:
+            active_hysteresis = datetime.fromisoformat(active_until) > now
+        except Exception:
+            active_hysteresis = False
+
+    if not is_shock and not active_hysteresis:
+        out["reason"] = "NO_SHOCK"
+        save_bloodbath_lane_state({**lane_state, "active": False, "active_reason": out["reason"], "attempts_hour": 0})
+        return out
+
+    cooldown_until = lane_state.get("cooldown_until")
+    if cooldown_until:
+        try:
+            if datetime.fromisoformat(cooldown_until) > now:
+                out["reason"] = "LANE_COOLDOWN"
+                out["active"] = False
+                return out
+        except Exception:
+            pass
+
+    out["active"] = True
+    out["reason"] = "MACRO_SHOCK" if is_shock else "HYSTERESIS"
+
+    since_1h = (now - timedelta(hours=1)).isoformat()
+    since_24h = (now - timedelta(hours=24)).isoformat()
+    attempts_by_symbol: dict[str, int] = {}
+    total_attempts = 0
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select symbol,count(*) from bloodbath_ghost_runs where ts>=? group by symbol", (since_1h,))
+        for sym, cnt in cur.fetchall():
+            attempts_by_symbol[str(sym)] = int(cnt or 0)
+            total_attempts += int(cnt or 0)
+
+        cur.execute("select count(*), coalesce(sum(net_pnl_bps),0), coalesce(avg(case when net_pnl_bps>0 then 1.0 else 0.0 end),0) from bloodbath_ghost_runs where ts>=?", (since_1h,))
+        t1, n1, w1 = cur.fetchone()
+        cur.execute("select count(*), coalesce(sum(net_pnl_bps),0), coalesce(avg(case when net_pnl_bps>0 then 1.0 else 0.0 end),0) from bloodbath_ghost_runs where ts>=?", (since_24h,))
+        t24, n24, w24 = cur.fetchone()
+    out["attempts_hour"] = total_attempts
+    out["attempts_by_symbol"] = attempts_by_symbol
+    out["ghost_1h"] = {"trades": int(t1 or 0), "net_pnl_bps": round(float(n1 or 0.0), 2), "winrate": round(float(w1 or 0.0), 3)}
+    out["ghost_24h"] = {"trades": int(t24 or 0), "net_pnl_bps": round(float(n24 or 0.0), 2), "winrate": round(float(w24 or 0.0), 3)}
+
+    # daily lane DD guard
+    if out["ghost_24h"]["net_pnl_bps"] <= -abs(BLOODBATH_DD_LIMIT_BPS_DAY):
+        out["active"] = False
+        out["reason"] = "LANE_DD_LIMIT"
+        save_bloodbath_lane_state({**lane_state, "active": False, "active_reason": out["reason"], "cooldown_until": (now + timedelta(seconds=BLOODBATH_LANE_COOLDOWN_SEC)).isoformat()})
+        return out
+
+    candidates = []
+    for inst in BLOODBATH_SYMBOL_ALLOWLIST:
+        base = inst.split("_")[0]
+        micro = micro_latest.get(base, {})
+        venue = venue_metrics.get(base, {})
+        if not micro:
+            continue
+        spread = float(micro.get("spread_bps_p95_300", venue.get("spread_bps", 9999.0)) or 9999.0)
+        spread_stability = float(micro.get("spread_stability", 0.0) or 0.0)
+        pressure_conf = float(micro.get("pressure_confidence", 0.0) or 0.0)
+        depth20 = float(micro.get("depth_usd_20bps", 0.0) or 0.0)
+        utilization = min(1.0, depth20 / max(1.0, TARGET_NOTIONAL_USDT))
+        if pressure_conf < BLOODBATH_PRESSURE_CONF_MIN or spread > BLOODBATH_SPREAD_MAX_BPS or spread_stability < 0.45 or utilization < BLOODBATH_MIN_UTILIZATION:
+            continue
+        candidates.append({
+            "symbol": base,
+            "instrument_symbol": base_to_instrument.get(base) or inst,
+            "pressure_confidence": round(pressure_conf, 3),
+            "spread_stability": round(spread_stability, 3),
+            "spread_bps": round(spread, 2),
+            "utilization": round(utilization, 3),
+        })
+
+    candidates = sorted(candidates, key=lambda x: (x["pressure_confidence"], x["utilization"]), reverse=True)
+    out["candidates_top"] = candidates[:3]
+
+    attempts_made = 0
+    consec_losses = int(lane_state.get("consecutive_losses", 0) or 0)
+    for cand in candidates:
+        sym = cand["symbol"]
+        inst = cand["instrument_symbol"]
+        if total_attempts >= BLOODBATH_MAX_ATTEMPTS_PER_HOUR:
+            break
+        if attempts_by_symbol.get(sym, 0) >= BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR:
+            continue
+        if consec_losses >= BLOODBATH_LANE_CONSEC_LOSS_LIMIT:
+            out["active"] = False
+            out["reason"] = "LANE_CONSEC_LOSS_COOLDOWN"
+            break
+        try:
+            cd = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
+            rows = cd.get("result", {}).get("data", []) if isinstance(cd, dict) else []
+            if len(rows) < 3:
+                continue
+            entry = float(rows[-2].get("o") or 0.0)
+            exitp = float(rows[-1].get("c") or 0.0)
+            if entry <= 0 or exitp <= 0:
+                continue
+            m = micro_latest.get(sym, {})
+            spread = float(m.get("spread_bps_p95_300", 20.0) or 20.0)
+            obi_abs = abs(float(m.get("obi_20bps", 0.0) or 0.0))
+            p_fill = _maker_fill_probability(spread, float(venue_metrics.get(sym, {}).get("chg_24h_abs", 0.0) or 0.0), obi_abs, float(m.get("spread_stability", 0.0) or 0.0), float(m.get("trade_rate_proxy", 0.0) or 0.0), BLOODBATH_MAKER_TIME_BUDGET_SEC)
+            if float(m.get("spread_stability", 0.0) or 0.0) < 0.5:
+                p_fill *= 0.5
+            maker_cost = max(1.5, spread * 0.25)
+            fallback_cost = max(2.5, spread * 0.55)
+            exp_cost = (p_fill * maker_cost) + ((1 - p_fill) * fallback_cost)
+            pnl_bps = ((exitp - entry) / entry) * 10000.0
+            net = pnl_bps - exp_cost
+            exec_style = "maker-first" if p_fill >= 0.45 else "taker-fallback"
+            with db() as c:
+                c.execute(
+                    """
+                    insert into bloodbath_ghost_runs (ts,symbol,lane,entry_ts,exit_ts,entry_price,exit_price,net_pnl_bps,execution_style,utilization,regime,macro_shock,p_fill_maker,maker_time_budget_sec,costs_bps,details_json)
+                    values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (utc_now(), sym, "BLOODBATH_LANE", utc_now(), utc_now(), entry, exitp, net, exec_style, float(cand["utilization"]), regime, int(bool(macro.get("macro_shock"))), p_fill, BLOODBATH_MAKER_TIME_BUDGET_SEC, exp_cost, json.dumps(cand, default=str)),
+                )
+            attempts_by_symbol[sym] = attempts_by_symbol.get(sym, 0) + 1
+            total_attempts += 1
+            attempts_made += 1
+            if net < 0:
+                consec_losses += 1
+            else:
+                consec_losses = 0
+        except Exception:
+            continue
+
+    next_state = {
+        "active": bool(out["active"]),
+        "active_reason": out["reason"],
+        "active_until": (now + timedelta(seconds=BLOODBATH_HYSTERESIS_SEC)).isoformat() if is_shock else lane_state.get("active_until"),
+        "cooldown_until": (now + timedelta(seconds=BLOODBATH_LANE_COOLDOWN_SEC)).isoformat() if consec_losses >= BLOODBATH_LANE_CONSEC_LOSS_LIMIT else lane_state.get("cooldown_until"),
+        "consecutive_losses": consec_losses,
+        "attempts_hour": total_attempts,
+        "details": {
+            "attempts_made_this_cycle": attempts_made,
+            "attempts_by_symbol": attempts_by_symbol,
+            "lane_risk_fraction": BLOODBATH_LANE_RISK_FRACTION,
+        },
+    }
+    save_bloodbath_lane_state(next_state)
+    out["attempts_hour"] = total_attempts
+    return out
+
+
 def run_ghost_simulator() -> dict:
     since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     rows_done = 0
@@ -1271,6 +1544,7 @@ def run_cycle() -> dict:
     pressure_count = 0
     macro = detect_macro_shock(regime, news_hits, venue_metrics)
     risk_state = compute_shadow_risk_state()
+    bloodbath = run_bloodbath_lane(regime, macro, risk_state, venue_metrics, micro_latest, base_to_instrument)
 
     alpha_scored_count = 0
     cost_evaluated_count = 0
@@ -1763,6 +2037,7 @@ def run_cycle() -> dict:
         "risk_state": risk_state,
         "macro_shock": macro,
         "autotuner_frozen": bool(macro.get("macro_shock")),
+        "bloodbath_lane": bloodbath,
     }
 
     log_funnel(
@@ -1791,6 +2066,7 @@ def run_cycle() -> dict:
             "risk_state": risk_state,
             "macro_shock": macro,
             "autotuner_frozen": bool(macro.get("macro_shock")),
+            "bloodbath_lane": bloodbath,
         },
     )
 
@@ -1833,6 +2109,7 @@ def run_cycle() -> dict:
         "autotuner_frozen": bool(macro.get("macro_shock")),
         "risk_state": risk_state,
         "macro_shock": macro,
+        "bloodbath_lane": bloodbath,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
         "defillama_symbols_total": len(llama_syms),

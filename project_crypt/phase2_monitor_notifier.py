@@ -325,6 +325,9 @@ def hourly_summary() -> str:
     risk_state_line = "halted=False reason=- churn=0 consec=0 cooldown=0s window=60m"
     churn_basis_line = "churn_basis=ACTIONABLE_ATTEMPTS"
     macro_line = "macro_shock=False"
+    bloodbath_line = "LaneActive=False reason=- attempts_hour=0"
+    bloodbath_candidates_line = "none"
+    bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
     sources_present_txt = "{}"
 
     if funnel:
@@ -358,6 +361,18 @@ def hourly_summary() -> str:
         churn_basis_line = f"churn_basis={rs.get('churn_basis', 'ACTIONABLE_ATTEMPTS')}"
         m = sj.get('macro_shock', {}) or {}
         macro_line = f"macro_shock={bool(m.get('macro_shock', False))} btc_1h_abs={m.get('btc_ret_1h_abs', 0)} news_velocity={m.get('news_velocity', 0)}"
+        bb = sj.get('bloodbath_lane', {}) or {}
+        bloodbath_line = f"LaneActive={bool(bb.get('active', False))} reason={bb.get('reason', '-')} attempts_hour={int(bb.get('attempts_hour', 0) or 0)}"
+        cands = bb.get('candidates_top', []) or []
+        bloodbath_candidates_line = ", ".join(
+            f"{x.get('symbol')}[pc={x.get('pressure_confidence')},ss={x.get('spread_stability')},util={x.get('utilization')}]" for x in cands[:3]
+        ) or "none"
+        g1 = bb.get('ghost_1h', {}) or {}
+        g24 = bb.get('ghost_24h', {}) or {}
+        bloodbath_ghost_line = (
+            f"1h:trades={int(g1.get('trades', 0) or 0)} net={float(g1.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g1.get('winrate', 0.0) or 0.0):.2f}"
+            f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
+        )
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
     cliff_hint = "none"
@@ -395,6 +410,9 @@ def hourly_summary() -> str:
         f"RiskState: {risk_state_line}\n"
         f"RiskChurnBasis: {churn_basis_line}\n"
         f"MacroShock: {macro_line}\n"
+        f"BloodbathLane: {bloodbath_line}\n"
+        f"BloodbathCandidatesTop: {bloodbath_candidates_line}\n"
+        f"BloodbathGhost: {bloodbath_ghost_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
