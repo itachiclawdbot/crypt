@@ -59,6 +59,8 @@ CHURN_PENALTY_BOX_SEC = int(os.getenv("CHURN_PENALTY_BOX_SEC", "900"))
 CHURN_GLOBAL_PENALTY_SYMBOLS_LIMIT = int(os.getenv("CHURN_GLOBAL_PENALTY_SYMBOLS_LIMIT", "4"))
 CHURN_GLOBAL_WINDOW_MIN = int(os.getenv("CHURN_GLOBAL_WINDOW_MIN", "15"))
 CHURN_HOT_LOOP_MAX_IDENTICAL_5M = int(os.getenv("CHURN_HOT_LOOP_MAX_IDENTICAL_5M", "8"))
+CHURN_RETRY_MAX = int(os.getenv("CHURN_RETRY_MAX", "3"))
+CHURN_RETRY_BACKOFF_BASE_SEC = float(os.getenv("CHURN_RETRY_BACKOFF_BASE_SEC", "0.7"))
 
 
 class Source:
@@ -1212,6 +1214,31 @@ def put_penalty_box(symbol: str, reason: str) -> None:
         )
 
 
+def _get_json_retry(url: str, risk_state_fn=None) -> dict | list:
+    last_err = None
+    for i in range(max(1, CHURN_RETRY_MAX)):
+        if risk_state_fn is not None:
+            try:
+                rs = risk_state_fn()
+                if rs.get("halted"):
+                    raise RuntimeError("RISK_FLIP_ABORT")
+            except Exception as e:
+                raise e
+        try:
+            return get_json(url)
+        except Exception as e:
+            last_err = e
+            if "429" in str(e):
+                sleep_s = (CHURN_RETRY_BACKOFF_BASE_SEC * (2 ** i)) + random.uniform(0.05, 0.4)
+                time.sleep(min(5.0, sleep_s))
+            else:
+                sleep_s = (CHURN_RETRY_BACKOFF_BASE_SEC * (2 ** i)) + random.uniform(0.05, 0.3)
+                time.sleep(min(4.0, sleep_s))
+    if last_err:
+        raise last_err
+    raise RuntimeError("retry_exhausted")
+
+
 def _btc_1h_return_abs() -> float:
     try:
         d = get_json("https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name=BTC_USDT&timeframe=1h")
@@ -1754,7 +1781,10 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             out["reason"] = "GLOBAL_RISK_HALTED"
             break
         try:
-            cd = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
+            cd = _get_json_retry(
+                f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m",
+                risk_state_fn=load_risk_state,
+            )
             rows = cd.get("result", {}).get("data", []) if isinstance(cd, dict) else []
             if len(rows) < 3:
                 log_churn_event(attempt_id, sym, "ATTEMPT", "STALE_BOOK_ABORT", False, {"rows": len(rows)}, lane="BLOODBATH_LANE")
@@ -1802,7 +1832,15 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             elif not expired_unfilled:
                 consec_losses = 0
         except Exception as e:
-            log_churn_event(attempt_id, sym, "ATTEMPT", "VENUE_ERROR", False, {"error": str(e)[:160]}, lane="BLOODBATH_LANE")
+            es = str(e)
+            reason = "VENUE_ERROR"
+            if "RISK_FLIP_ABORT" in es:
+                reason = "RISK_FLIP_ABORT"
+            elif "429" in es:
+                reason = "RATE_LIMIT"
+            elif "timeout" in es.lower():
+                reason = "API_TIMEOUT"
+            log_churn_event(attempt_id, sym, "ATTEMPT", reason, False, {"error": es[:160]}, lane="BLOODBATH_LANE")
             continue
 
     next_state = {

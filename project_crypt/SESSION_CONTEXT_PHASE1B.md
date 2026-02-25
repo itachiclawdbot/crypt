@@ -684,3 +684,9 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for churn misclassification fix wave.
+
+### 2026-02-25 follow-up alignment patch (post-summary compare)
+- Added explicit retry wrapper with max retries + exponential backoff + jitter for last-mile candle fetch path (`_get_json_retry`).
+- Retry loop now re-checks global RiskState in-loop and aborts with `RISK_FLIP_ABORT`.
+- Added finer attempt failure classification for exceptions: `RATE_LIMIT`, `API_TIMEOUT`, `VENUE_ERROR`.
+- Kept event idempotency behavior (attempt/execution dedupe) intact.
