@@ -48,6 +48,12 @@ BLOODBATH_GHOST_EXIT_HORIZON_SEC = int(os.getenv("BLOODBATH_GHOST_EXIT_HORIZON_S
 BLOODBATH_DD_LIMIT_BPS_DAY = float(os.getenv("BLOODBATH_DD_LIMIT_BPS_DAY", "80"))
 BLOODBATH_HYSTERESIS_SEC = int(os.getenv("BLOODBATH_HYSTERESIS_SEC", "3600"))
 
+PHASE2_AUTOTUNER_APPLY = str(os.getenv("PHASE2_AUTOTUNER_APPLY", "false")).lower() in {"1", "true", "yes", "on"}
+PHASE2_AUTOTUNER_MAX_DAILY_CHANGE = float(os.getenv("PHASE2_AUTOTUNER_MAX_DAILY_CHANGE", "0.05"))
+PHASE2_AUTOTUNER_MIN_N = int(os.getenv("PHASE2_AUTOTUNER_MIN_N", "40"))
+PHASE2_AUTOTUNER_MIN_SORTINO = float(os.getenv("PHASE2_AUTOTUNER_MIN_SORTINO", "0.25"))
+PHASE2_AUTOTUNER_P5_FLOOR = float(os.getenv("PHASE2_AUTOTUNER_P5_FLOOR", "-80"))
+
 
 class Source:
     CRYPTOCOM = "crypto.com"
@@ -278,6 +284,38 @@ def init_tables() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS macro_state_current (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                ts TEXT NOT NULL,
+                macro_shock INTEGER NOT NULL,
+                entered_at TEXT,
+                calm_checks INTEGER NOT NULL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parameter_governor_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                recommendation_json TEXT,
+                applied INTEGER NOT NULL,
+                reason TEXT
+            )
+            """
+        )
+        _ensure_column(c, "ghost_sim_runs", "macro_shock", "INTEGER")
+        _ensure_column(c, "ghost_sim_runs", "estimated_cost_bps", "REAL")
+        _ensure_column(c, "ghost_sim_runs", "execution_style", "TEXT")
+        _ensure_column(c, "risk_state_current", "previous_halt_reason", "TEXT")
+        _ensure_column(c, "risk_state_current", "attempt_churn_count", "INTEGER")
+        _ensure_column(c, "risk_state_current", "execution_churn_count", "INTEGER")
+        _ensure_column(c, "risk_state_current", "loss_pressure_24h", "REAL")
         _ensure_column(c, "candidate_funnel_log", "watch_total", "INTEGER")
         _ensure_column(c, "candidate_funnel_log", "actionable_total", "INTEGER")
         _ensure_column(c, "candidate_funnel_log", "alpha_scored_total", "INTEGER")
@@ -1041,30 +1079,56 @@ def emit_listing_front_run(new_listings: set[str]) -> set[str]:
 
 def tradable_autotuner_stats(hours: int = 24) -> dict:
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    out = {"ghost_runs": 0, "avg_net_pnl_bps": 0.0, "by_reject_reason": {}}
+    out = {"ghost_runs": 0, "avg_net_pnl_bps": 0.0, "median_net_pnl_bps": 0.0, "p25": 0.0, "p75": 0.0, "p5": 0.0, "hit_rate": 0.0, "by_reject_reason": {}}
+    all_vals: list[float] = []
     with db() as c:
         cur = c.cursor()
         cur.execute(
             """
-            select reject_reason, count(*) c, avg(net_pnl_bps) a
+            select reject_reason, net_pnl_bps
             from ghost_sim_runs
             where ts>=? and instrument_symbol like '%_%'
-            group by reject_reason
             """,
             (since,),
         )
         rows = cur.fetchall()
-        total = 0
-        weighted = 0.0
-        for r in rows:
-            rr = str(r[0] or "unknown")
-            ccount = int(r[1] or 0)
-            avg = float(r[2] or 0.0)
-            out["by_reject_reason"][rr] = {"count": ccount, "avg_net_pnl_bps": round(avg, 2)}
-            total += ccount
-            weighted += avg * ccount
-        out["ghost_runs"] = total
-        out["avg_net_pnl_bps"] = round(weighted / total, 2) if total else 0.0
+        bucket: dict[str, list[float]] = {}
+        for rr, val in rows:
+            k = str(rr or "unknown")
+            v = float(val or 0.0)
+            bucket.setdefault(k, []).append(v)
+            all_vals.append(v)
+
+        for rr, vals in bucket.items():
+            vals_sorted = sorted(vals)
+            n = len(vals_sorted)
+            if n == 0:
+                continue
+            p25 = vals_sorted[int(max(0, min(n - 1, round(0.25 * (n - 1)))))]
+            p75 = vals_sorted[int(max(0, min(n - 1, round(0.75 * (n - 1)))))]
+            p5 = vals_sorted[int(max(0, min(n - 1, round(0.05 * (n - 1)))))]
+            med = vals_sorted[n // 2]
+            hit = sum(1 for x in vals_sorted if x > 0) / max(1, n)
+            out["by_reject_reason"][rr] = {
+                "n": n,
+                "avg_net_pnl_bps": round(sum(vals_sorted) / n, 2),
+                "median": round(med, 2),
+                "p25": round(p25, 2),
+                "p75": round(p75, 2),
+                "p5": round(p5, 2),
+                "hit_rate": round(hit, 3),
+            }
+
+    if all_vals:
+        s = sorted(all_vals)
+        n = len(s)
+        out["ghost_runs"] = n
+        out["avg_net_pnl_bps"] = round(sum(s) / n, 2)
+        out["median_net_pnl_bps"] = round(s[n // 2], 2)
+        out["p25"] = round(s[int(round(0.25 * (n - 1)))], 2)
+        out["p75"] = round(s[int(round(0.75 * (n - 1)))], 2)
+        out["p5"] = round(s[int(round(0.05 * (n - 1)))], 2)
+        out["hit_rate"] = round(sum(1 for x in s if x > 0) / n, 3)
     return out
 
 
@@ -1084,30 +1148,82 @@ def _btc_1h_return_abs() -> float:
 
 
 def detect_macro_shock(regime: str, news_hits: int, venue_metrics: dict[str, dict]) -> dict:
+    now = datetime.now(timezone.utc)
     btc_ret_1h_abs = _btc_1h_return_abs()
     moves = [abs(float(v.get("chg_24h_abs", 0.0))) for v in venue_metrics.values() if v]
     median_move = _percentile(moves, 0.5, 0.0)
-    shock = bool(regime == "VOLATILE" or btc_ret_1h_abs >= 0.02 or median_move >= 0.08 or news_hits >= 12)
+
+    # entry stricter than exit to avoid sticky/always-on shock
+    enter = bool(btc_ret_1h_abs >= 0.02 or median_move >= 0.10 or news_hits >= 20 or (regime == "VOLATILE" and btc_ret_1h_abs >= 0.012))
+    calm = bool(btc_ret_1h_abs < 0.010 and median_move < 0.06 and news_hits < 8)
+
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select macro_shock, entered_at, calm_checks, details_json from macro_state_current where id=1")
+        r = cur.fetchone()
+        prev_active = bool(r[0]) if r else False
+        entered_at = r[1] if r else None
+        calm_checks = int(r[2] or 0) if r else 0
+
+        active = prev_active
+        if enter:
+            active = True
+            calm_checks = 0
+            entered_at = entered_at or now.isoformat()
+        elif prev_active:
+            calm_checks = calm_checks + 1 if calm else 0
+            if calm_checks >= 3:
+                active = False
+                entered_at = None
+                calm_checks = 0
+
+        payload = {
+            "btc_ret_1h_abs": round(btc_ret_1h_abs, 5),
+            "median_abs_move_24h": round(float(median_move), 5),
+            "news_velocity": int(news_hits),
+            "regime": regime,
+            "enter_trigger": enter,
+            "calm": calm,
+        }
+        c.execute(
+            """
+            insert into macro_state_current (id,ts,macro_shock,entered_at,calm_checks,details_json)
+            values (1,?,?,?,?,?)
+            on conflict(id) do update set
+              ts=excluded.ts, macro_shock=excluded.macro_shock, entered_at=excluded.entered_at,
+              calm_checks=excluded.calm_checks, details_json=excluded.details_json
+            """,
+            (utc_now(), int(active), entered_at, calm_checks, json.dumps(payload, default=str)),
+        )
+
     return {
-        "macro_shock": shock,
+        "macro_shock": bool(active),
         "btc_ret_1h_abs": round(btc_ret_1h_abs, 5),
         "median_abs_move_24h": round(float(median_move), 5),
         "news_velocity": int(news_hits),
+        "regime": regime,
+        "enter_trigger": enter,
+        "calm": calm,
+        "entered_at": entered_at,
     }
 
 
 def load_risk_state() -> dict:
     with db() as c:
         cur = c.cursor()
-        cur.execute("select halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json from risk_state_current where id=1")
+        cur.execute("select halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json,previous_halt_reason,attempt_churn_count,execution_churn_count,loss_pressure_24h from risk_state_current where id=1")
         r = cur.fetchone()
         if not r:
             return {
                 "halted": False,
                 "halt_reason": None,
+                "previous_halt_reason": None,
                 "churn_basis": "ACTIONABLE_ATTEMPTS",
                 "churn_count": 0,
+                "attempt_churn_count": 0,
+                "execution_churn_count": 0,
                 "consecutive_losses": 0,
+                "loss_pressure_24h": 0.0,
                 "cooldown_seconds_remaining": 0,
                 "cooldown_until": None,
                 "window_minutes": 60,
@@ -1123,54 +1239,83 @@ def load_risk_state() -> dict:
             "cooldown_until": r[6],
             "window_minutes": int(r[7] or 60),
             "details": json.loads(r[8] or "{}"),
+            "previous_halt_reason": r[9],
+            "attempt_churn_count": int(r[10] or 0),
+            "execution_churn_count": int(r[11] or 0),
+            "loss_pressure_24h": float(r[12] or 0.0),
         }
 
 
-def compute_shadow_risk_state() -> dict:
+def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
     now = datetime.now(timezone.utc)
     window_minutes = int(os.getenv("PHASE2_RISK_WINDOW_MIN", "60"))
     cooldown_sec = int(os.getenv("PHASE2_RISK_COOLDOWN_SEC", "3600"))
-    churn_limit = int(os.getenv("PHASE2_RISK_CHURN_LIMIT", "18"))
+    attempt_churn_limit = int(os.getenv("PHASE2_RISK_ATTEMPT_CHURN_LIMIT", "22"))
+    execution_churn_limit = int(os.getenv("PHASE2_RISK_EXEC_CHURN_LIMIT", "14"))
     consec_loss_limit = int(os.getenv("PHASE2_RISK_CONSEC_LOSS_LIMIT", "8"))
+
+    if macro_shock:
+        attempt_churn_limit = max(6, int(attempt_churn_limit * 0.7))
+
     since = (now - timedelta(minutes=window_minutes)).isoformat()
+    since_24h = (now - timedelta(hours=24)).isoformat()
     with db() as c:
         cur = c.cursor()
-        cur.execute("select count(*) from universe_state where ts>=? and status='ACTIONABLE'", (since,))
-        actionable_attempts = int((cur.fetchone() or [0])[0] or 0)
+        # unique attempt churn in 15m buckets
+        cur.execute(
+            """
+            select count(*) from (
+              select coalesce(instrument_symbol,symbol) as ikey, substr(ts,1,16) as bucket
+              from universe_state
+              where ts>=? and status='ACTIONABLE'
+              group by ikey, bucket
+            )
+            """,
+            (since,),
+        )
+        attempt_churn = int((cur.fetchone() or [0])[0] or 0)
         cur.execute("select count(*) from ghost_sim_runs where ts>=?", (since,))
-        ghost_exec = int((cur.fetchone() or [0])[0] or 0)
-        cur.execute("select net_pnl_bps from ghost_sim_runs order by id desc limit 30")
-        last_runs = [float(r[0] or 0.0) for r in cur.fetchall()]
+        execution_churn = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select net_pnl_bps from ghost_sim_runs where ts>=? order by id desc limit 60", (since_24h,))
+        last_runs_24h = [float(r[0] or 0.0) for r in cur.fetchall()]
 
+    # Consecutive losses from latest execution-like outcomes
     consec_losses = 0
-    for pnl in last_runs:
+    for pnl in last_runs_24h[:30]:
         if pnl < 0:
             consec_losses += 1
         else:
             break
+    loss_pressure = float(sum(1 for x in last_runs_24h if x < 0))
 
-    churn_count = actionable_attempts + ghost_exec
     halt_reason = None
     halted = False
-    if churn_count >= churn_limit:
-        halted = True
-        halt_reason = "RISK_CHURN"
-    elif consec_losses >= consec_loss_limit and ghost_exec > 0:
-        halted = True
-        halt_reason = "RISK_CONSEC_LOSSES"
+    previous_halt_reason = None
 
     prev = load_risk_state()
     cooldown_until = prev.get("cooldown_until")
+    if prev.get("halted"):
+        previous_halt_reason = prev.get("halt_reason")
+
+    if execution_churn >= execution_churn_limit:
+        halted = True
+        halt_reason = "RISK_CHURN"
+    elif consec_losses >= consec_loss_limit and execution_churn > 0:
+        halted = True
+        halt_reason = "RISK_CONSEC_LOSSES"
+
     if halted:
         cooldown_until = (now + timedelta(seconds=cooldown_sec)).isoformat()
-    elif prev.get("halted") and cooldown_until:
+    elif cooldown_until:
         try:
             remain = int((datetime.fromisoformat(cooldown_until) - now).total_seconds())
             if remain > 0:
                 halted = True
-                halt_reason = prev.get("halt_reason") or "RISK_COOLDOWN"
+                halt_reason = "COOLDOWN"
+            else:
+                cooldown_until = None
         except Exception:
-            pass
+            cooldown_until = None
 
     cooldown_remaining = 0
     if cooldown_until:
@@ -1179,28 +1324,36 @@ def compute_shadow_risk_state() -> dict:
         except Exception:
             cooldown_remaining = 0
 
+    # attempt churn = soft throttle only
+    soft_throttle = bool(attempt_churn >= attempt_churn_limit)
+
     state = {
         "halted": bool(halted),
         "halt_reason": halt_reason,
-        "churn_basis": "ACTIONABLE_ATTEMPTS",
-        "churn_count": int(churn_count),
+        "previous_halt_reason": previous_halt_reason,
+        "churn_basis": "ACTIONABLE_ATTEMPTS+EXECUTIONS",
+        "churn_count": int(attempt_churn + execution_churn),
+        "attempt_churn_count": int(attempt_churn),
+        "execution_churn_count": int(execution_churn),
         "consecutive_losses": int(consec_losses),
+        "loss_pressure_24h": round(loss_pressure, 3),
         "cooldown_seconds_remaining": int(cooldown_remaining),
         "cooldown_until": cooldown_until,
         "window_minutes": window_minutes,
         "details": {
-            "actionable_attempts": actionable_attempts,
-            "ghost_exec": ghost_exec,
-            "churn_limit": churn_limit,
+            "attempt_churn_limit": attempt_churn_limit,
+            "execution_churn_limit": execution_churn_limit,
             "consec_loss_limit": consec_loss_limit,
+            "soft_throttle": soft_throttle,
+            "macro_shock": bool(macro_shock),
         },
     }
 
     with db() as c:
         c.execute(
             """
-            insert into risk_state_current (id,ts,halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json)
-            values (1,?,?,?,?,?,?,?,?,?,?)
+            insert into risk_state_current (id,ts,halted,halt_reason,churn_basis,churn_count,consecutive_losses,cooldown_seconds_remaining,cooldown_until,window_minutes,details_json,previous_halt_reason,attempt_churn_count,execution_churn_count,loss_pressure_24h)
+            values (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             on conflict(id) do update set
               ts=excluded.ts, halted=excluded.halted, halt_reason=excluded.halt_reason,
               churn_basis=excluded.churn_basis, churn_count=excluded.churn_count,
@@ -1208,7 +1361,11 @@ def compute_shadow_risk_state() -> dict:
               cooldown_seconds_remaining=excluded.cooldown_seconds_remaining,
               cooldown_until=excluded.cooldown_until,
               window_minutes=excluded.window_minutes,
-              details_json=excluded.details_json
+              details_json=excluded.details_json,
+              previous_halt_reason=excluded.previous_halt_reason,
+              attempt_churn_count=excluded.attempt_churn_count,
+              execution_churn_count=excluded.execution_churn_count,
+              loss_pressure_24h=excluded.loss_pressure_24h
             """,
             (
                 utc_now(),
@@ -1221,9 +1378,63 @@ def compute_shadow_risk_state() -> dict:
                 state["cooldown_until"],
                 state["window_minutes"],
                 json.dumps(state["details"], default=str),
+                state["previous_halt_reason"],
+                state["attempt_churn_count"],
+                state["execution_churn_count"],
+                state["loss_pressure_24h"],
             ),
         )
     return state
+
+
+def parameter_governor_recommend(summary: dict, autotuner_stats: dict, risk_state: dict, macro: dict) -> dict:
+    halted = bool(risk_state.get("halted", False))
+    shock = bool(macro.get("macro_shock", False))
+    n = int(autotuner_stats.get("ghost_runs", 0) or 0)
+    mean = float(autotuner_stats.get("avg_net_pnl_bps", 0.0) or 0.0)
+    p5 = float(autotuner_stats.get("p5", 0.0) or 0.0)
+    hit = float(autotuner_stats.get("hit_rate", 0.0) or 0.0)
+    # simple Sortino proxy (only downside semidev)
+    downside = []
+    for rr in (autotuner_stats.get("by_reject_reason") or {}).values():
+        if float(rr.get("avg_net_pnl_bps", 0.0)) < 0:
+            downside.append(abs(float(rr.get("avg_net_pnl_bps", 0.0))))
+    downside_dev = (sum(x * x for x in downside) / max(1, len(downside))) ** 0.5
+    sortino = mean / max(1e-6, downside_dev)
+
+    suspend = bool(shock or halted or p5 < PHASE2_AUTOTUNER_P5_FLOOR)
+    stable = bool((summary.get("risk_pass_total", 0) or 0) > 0 and (summary.get("cost_pass_total", 0) or 0) > 0)
+    can_loosen = bool((not suspend) and stable and n >= PHASE2_AUTOTUNER_MIN_N and mean > 0 and sortino >= PHASE2_AUTOTUNER_MIN_SORTINO)
+
+    rec = {
+        "mode": "recommend_only" if not PHASE2_AUTOTUNER_APPLY else "apply_enabled",
+        "namespace": "core",
+        "suspended": suspend,
+        "suspend_reason": "macro_shock_or_halt_or_tail" if suspend else None,
+        "metrics": {
+            "n": n,
+            "mean": round(mean, 2),
+            "hit_rate": round(hit, 3),
+            "p5": round(p5, 2),
+            "sortino_proxy": round(sortino, 3),
+        },
+        "recommendations": [],
+        "bounds": {
+            "daily_change_cap": PHASE2_AUTOTUNER_MAX_DAILY_CHANGE,
+            "apply": PHASE2_AUTOTUNER_APPLY,
+        },
+    }
+    if can_loosen:
+        rec["recommendations"].append({"param": "MIN_ACTIONABLE_SCORE", "direction": "down", "max_change_pct": PHASE2_AUTOTUNER_MAX_DAILY_CHANGE, "reason": "stable_positive_expectancy"})
+    else:
+        rec["recommendations"].append({"param": "MIN_ACTIONABLE_SCORE", "direction": "hold", "reason": "guardrails_not_met"})
+
+    with db() as c:
+        c.execute(
+            "insert into parameter_governor_log (ts,mode,namespace,recommendation_json,applied,reason) values (?,?,?,?,?,?)",
+            (utc_now(), rec["mode"], rec["namespace"], json.dumps(rec, default=str), 0, rec.get("suspend_reason") or "ok"),
+        )
+    return rec
 
 
 def load_bloodbath_lane_state() -> dict:
@@ -1295,6 +1506,9 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
     if risk_state.get("halted"):
         out["reason"] = "GLOBAL_RISK_HALTED"
         return out
+    if bool((risk_state.get("details") or {}).get("soft_throttle", False)):
+        out["reason"] = "SOFT_THROTTLE"
+        return out
 
     is_shock = bool(macro.get("macro_shock", False) or regime == "VOLATILE")
     active_until = lane_state.get("active_until")
@@ -1322,6 +1536,12 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
 
     out["active"] = True
     out["reason"] = "MACRO_SHOCK" if is_shock else "HYSTERESIS"
+
+    max_attempts_hour = BLOODBATH_MAX_ATTEMPTS_PER_HOUR
+    max_attempts_symbol = BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR
+    if bool(macro.get("macro_shock", False)):
+        max_attempts_hour = max(1, int(max_attempts_hour * 0.7))
+        max_attempts_symbol = max(1, int(max_attempts_symbol * 0.7))
 
     since_1h = (now - timedelta(hours=1)).isoformat()
     since_24h = (now - timedelta(hours=24)).isoformat()
@@ -1381,9 +1601,9 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
     for cand in candidates:
         sym = cand["symbol"]
         inst = cand["instrument_symbol"]
-        if total_attempts >= BLOODBATH_MAX_ATTEMPTS_PER_HOUR:
+        if total_attempts >= max_attempts_hour:
             break
-        if attempts_by_symbol.get(sym, 0) >= BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR:
+        if attempts_by_symbol.get(sym, 0) >= max_attempts_symbol:
             continue
         if consec_losses >= BLOODBATH_LANE_CONSEC_LOSS_LIMIT:
             out["active"] = False
@@ -1405,11 +1625,15 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             if float(m.get("spread_stability", 0.0) or 0.0) < 0.5:
                 p_fill *= 0.5
             maker_cost = max(1.5, spread * 0.25)
-            fallback_cost = max(2.5, spread * 0.55)
-            exp_cost = (p_fill * maker_cost) + ((1 - p_fill) * fallback_cost)
+            # Bloodbath lane default: no taker fallback, non-fill expires.
+            expired_unfilled = p_fill < 0.45
+            fallback_cost = 0.0
+            exp_cost = (p_fill * maker_cost)
             pnl_bps = ((exitp - entry) / entry) * 10000.0
-            net = pnl_bps - exp_cost
-            exec_style = "maker-first" if p_fill >= 0.45 else "taker-fallback"
+            net = (p_fill * pnl_bps) - exp_cost
+            if expired_unfilled:
+                net = -0.2  # slight opportunity-cost penalty
+            exec_style = "EXPIRED_UNFILLED" if expired_unfilled else "maker-first"
             with db() as c:
                 c.execute(
                     """
@@ -1439,6 +1663,8 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             "attempts_made_this_cycle": attempts_made,
             "attempts_by_symbol": attempts_by_symbol,
             "lane_risk_fraction": BLOODBATH_LANE_RISK_FRACTION,
+            "max_attempts_hour": max_attempts_hour,
+            "max_attempts_symbol": max_attempts_symbol,
         },
     }
     save_bloodbath_lane_state(next_state)
@@ -1446,24 +1672,44 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
     return out
 
 
-def run_ghost_simulator() -> dict:
-    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+def run_ghost_simulator(macro_shock: bool = False) -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
     rows_done = 0
+    sampled = 0
+    by_reason: Counter = Counter()
     with db() as c:
         cur = c.cursor()
         cur.execute(
             """
             select instrument_symbol, ts, deny_reason, alpha_score, metrics_json
             from universe_state
-            where ts>=? and status in ('WATCH','ELIGIBLE') and deny_reason in ('alpha-score-below-threshold','net-edge-too-low') and instrument_symbol is not null
+            where ts>=? and status in ('WATCH','ELIGIBLE')
+              and deny_reason in ('alpha-score-below-threshold','net-edge-too-low','RISK_CONFIDENCE_LOW')
+              and instrument_symbol is not null
             order by id desc
-            limit 120
+            limit 500
             """,
             (since,),
         )
-        candidates = cur.fetchall()
+        raw = cur.fetchall()
+        # stratified sample: cap repeats per symbol and reject reason
+        per_symbol: Counter = Counter()
+        candidates = []
+        for r in raw:
+            sym = str(r[0] or "")
+            reason = str(r[2] or "unknown")
+            key = f"{reason}:{sym}"
+            if per_symbol[key] >= 2:
+                continue
+            per_symbol[key] += 1
+            candidates.append(r)
+            sampled += 1
+            if sampled >= 140:
+                break
+
         for r in candidates:
             inst = r[0]
+            reason = str(r[2] or "unknown")
             try:
                 d = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
                 candles = d.get("result", {}).get("data", []) if isinstance(d, dict) else []
@@ -1473,20 +1719,28 @@ def run_ghost_simulator() -> dict:
                 exitp = float(candles[-1].get("c") or 0.0)
                 if entry <= 0 or exitp <= 0:
                     continue
+                metrics = {}
+                try:
+                    metrics = json.loads(r[4] or "{}")
+                except Exception:
+                    metrics = {}
+                est_cost = float(metrics.get("est_cost_bps", 18.0) or 18.0)
+                exec_style = str(metrics.get("execution_style", "taker") or "taker")
                 pnl_bps = ((exitp - entry) / entry) * 10000.0
-                costs_bps = 18.0
+                costs_bps = est_cost
                 net = pnl_bps - costs_bps
                 cur.execute(
                     """
-                    insert into ghost_sim_runs (ts,instrument_symbol,entry_ts,exit_ts,horizon,entry_price,exit_price,pnl_bps,costs_bps,net_pnl_bps,reject_reason,features_ref)
-                    values (?,?,?,?,?,?,?,?,?,?,?,?)
+                    insert into ghost_sim_runs (ts,instrument_symbol,entry_ts,exit_ts,horizon,entry_price,exit_price,pnl_bps,costs_bps,net_pnl_bps,reject_reason,features_ref,macro_shock,estimated_cost_bps,execution_style)
+                    values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (utc_now(), inst, r[1], utc_now(), "5m", entry, exitp, pnl_bps, costs_bps, net, r[2], None),
+                    (utc_now(), inst, r[1], utc_now(), "5m", entry, exitp, pnl_bps, costs_bps, net, reason, None, int(bool(macro_shock)), est_cost, exec_style),
                 )
                 rows_done += 1
+                by_reason[reason] += 1
             except Exception:
                 continue
-    return {"rows": rows_done}
+    return {"rows": rows_done, "sampled": sampled, "by_reason": dict(by_reason), "macro_shock": bool(macro_shock)}
 
 
 def run_cycle() -> dict:
@@ -1543,7 +1797,7 @@ def run_cycle() -> dict:
     obi_threshold = obi_threshold_for_regime(regime)
     pressure_count = 0
     macro = detect_macro_shock(regime, news_hits, venue_metrics)
-    risk_state = compute_shadow_risk_state()
+    risk_state = compute_shadow_risk_state(bool(macro.get("macro_shock", False)))
     bloodbath = run_bloodbath_lane(regime, macro, risk_state, venue_metrics, micro_latest, base_to_instrument)
 
     alpha_scored_count = 0
@@ -1986,6 +2240,7 @@ def run_cycle() -> dict:
 
     top_reasons = reject_counter.most_common(8)
     autotuner_stats = tradable_autotuner_stats(24)
+    governor = parameter_governor_recommend({"risk_pass_total": risk_pass_count, "cost_pass_total": cost_pass_count}, autotuner_stats, risk_state, macro)
 
     # dedupe by instrument_symbol
     deduped: dict[str, dict] = {}
@@ -2036,8 +2291,9 @@ def run_cycle() -> dict:
         "risk_reason_codes": dict(risk_code_counter),
         "risk_state": risk_state,
         "macro_shock": macro,
-        "autotuner_frozen": bool(macro.get("macro_shock")),
+        "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),
         "bloodbath_lane": bloodbath,
+        "parameter_governor": governor,
     }
 
     log_funnel(
@@ -2065,8 +2321,9 @@ def run_cycle() -> dict:
             "pressure_count": pressure_count,
             "risk_state": risk_state,
             "macro_shock": macro,
-            "autotuner_frozen": bool(macro.get("macro_shock")),
+            "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),
             "bloodbath_lane": bloodbath,
+            "parameter_governor": governor,
         },
     )
 
@@ -2106,10 +2363,11 @@ def run_cycle() -> dict:
         "sanity": sanity,
         "cost_fail_breakdown": dict(cost_fail_breakdown),
         "autotuner_tradable": autotuner_stats,
-        "autotuner_frozen": bool(macro.get("macro_shock")),
+        "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),
         "risk_state": risk_state,
         "macro_shock": macro,
         "bloodbath_lane": bloodbath,
+        "parameter_governor": governor,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),
         "defillama_symbols_total": len(llama_syms),
@@ -2165,11 +2423,9 @@ def main() -> None:
                 tg.send(build_startup_ping(summary))
                 startup_ping_sent = True
             if time.time() - last_ghost_run >= 3600:
-                if bool((summary.get("macro_shock") or {}).get("macro_shock", False)):
-                    put_signal(None, Source.SYSTEM, "ghost_sim_hourly_skipped", {"reason": "macro_shock"})
-                else:
-                    ghost = run_ghost_simulator()
-                    put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
+                is_shock = bool((summary.get("macro_shock") or {}).get("macro_shock", False))
+                ghost = run_ghost_simulator(macro_shock=is_shock)
+                put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
                 last_ghost_run = time.time()
             write_status({
                 "state": "cycle_complete",

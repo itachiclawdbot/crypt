@@ -27,6 +27,12 @@ def _safe_ratio(num: float, den: float) -> float:
     return num / den
 
 
+def _safe_ratio_nullable(num: float, den: float) -> float | None:
+    if den <= 0:
+        return None
+    return num / den
+
+
 def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: str) -> tuple[str, str, str]:
     cur.execute(
         """
@@ -52,10 +58,10 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: st
     risk_pass = sum(int(r["risk_pass_total"] or 0) for r in rows)
 
     # Step-down ratios (derivative bottleneck detection)
-    r_scored_to_costed = _safe_ratio(costed, scored)
-    r_costed_to_costpass = _safe_ratio(cost_pass, costed)
-    r_costpass_to_riskpass = _safe_ratio(risk_pass, cost_pass)
-    r_riskpass_to_actionable = _safe_ratio(actionable, risk_pass)
+    r_scored_to_costed = _safe_ratio_nullable(costed, scored)
+    r_costed_to_costpass = _safe_ratio_nullable(cost_pass, costed)
+    r_costpass_to_riskpass = _safe_ratio_nullable(risk_pass, cost_pass)
+    r_riskpass_to_actionable = _safe_ratio_nullable(actionable, risk_pass)
 
     stage_rates = {
         "scored_to_costed": r_scored_to_costed,
@@ -63,18 +69,22 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: st
         "costpass_to_riskpass": r_costpass_to_riskpass,
         "riskpass_to_actionable": r_riskpass_to_actionable,
     }
-    bottleneck_stage = min(stage_rates, key=stage_rates.get)
+    valid = {k: v for k, v in stage_rates.items() if v is not None}
+    bottleneck_stage = min(valid, key=valid.get) if valid else "none"
 
     recommendation = {
         "scored_to_costed": "Improve micro-feature coverage + mapping-quality so scored candidates reach cost eval.",
         "costed_to_costpass": "Cost gate is primary bottleneck: tune spread-toxic handling, slippage model, and small-cap lane sizing.",
         "costpass_to_riskpass": "Risk gate is bottleneck: inspect confidence thresholds and risk flags calibration.",
         "riskpass_to_actionable": "Final proposal stage is bottleneck: inspect final proposal constraints.",
+        "none": "No valid bottleneck ratio due to low sample/denominator.",
     }[bottleneck_stage]
 
+    f2 = lambda x: ("null" if x is None else f"{x:.2f}")
     analysis_txt = (
-        f"{label}_step_rates scored->costed={r_scored_to_costed:.2f} costed->cost_pass={r_costed_to_costpass:.2f} "
-        f"cost_pass->risk_pass={r_costpass_to_riskpass:.2f} risk_pass->actionable={r_riskpass_to_actionable:.2f}; "
+        f"{label}_step_rates scored->costed={f2(r_scored_to_costed)} costed->cost_pass={f2(r_costed_to_costpass)} "
+        f"cost_pass->risk_pass={f2(r_costpass_to_riskpass)} risk_pass->actionable={f2(r_riskpass_to_actionable)}; "
+        f"n(scored={scored},costed={costed},cost_pass={cost_pass},risk_pass={risk_pass},actionable={actionable}); "
         f"bottleneck={bottleneck_stage}"
     )
     return analysis_txt, bottleneck_stage, recommendation
@@ -328,6 +338,7 @@ def hourly_summary() -> str:
     bloodbath_line = "LaneActive=False reason=- attempts_hour=0"
     bloodbath_candidates_line = "none"
     bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
+    governor_line = "mode=recommend_only suspended=True reason=- n=0"
     sources_present_txt = "{}"
 
     if funnel:
@@ -354,8 +365,9 @@ def hourly_summary() -> str:
         risk_codes_line = str(sj.get('risk_reason_codes', {}))
         rs = sj.get('risk_state', {}) or {}
         risk_state_line = (
-            f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} "
-            f"churn={int(rs.get('churn_count', 0) or 0)} consec={int(rs.get('consecutive_losses', 0) or 0)} "
+            f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} prev={rs.get('previous_halt_reason') or '-'} "
+            f"attempt_churn={int(rs.get('attempt_churn_count', 0) or 0)} exec_churn={int(rs.get('execution_churn_count', 0) or 0)} "
+            f"loss24h={float(rs.get('loss_pressure_24h', 0.0) or 0.0):.1f} consec={int(rs.get('consecutive_losses', 0) or 0)} "
             f"cooldown={int(rs.get('cooldown_seconds_remaining', 0) or 0)}s window={int(rs.get('window_minutes', 60) or 60)}m"
         )
         churn_basis_line = f"churn_basis={rs.get('churn_basis', 'ACTIONABLE_ATTEMPTS')}"
@@ -373,7 +385,20 @@ def hourly_summary() -> str:
             f"1h:trades={int(g1.get('trades', 0) or 0)} net={float(g1.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g1.get('winrate', 0.0) or 0.0):.2f}"
             f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
         )
+        gov = sj.get('parameter_governor', {}) or {}
+        gm = gov.get('metrics', {}) or {}
+        governor_line = (
+            f"mode={gov.get('mode','recommend_only')} suspended={bool(gov.get('suspended', True))} "
+            f"reason={gov.get('suspend_reason') or '-'} n={int(gm.get('n', 0) or 0)} "
+            f"mean={float(gm.get('mean', 0.0) or 0.0):.1f} p5={float(gm.get('p5', 0.0) or 0.0):.1f}"
+        )
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
+
+        # hard-stop bottleneck override
+        if bool(rs.get('halted', False)) or (int(funnel['cost_pass_total'] or 0) > 0 and int(funnel['risk_pass_total'] or 0) == 0):
+            bottleneck_1h = "RISK_HALT"
+            bottleneck_6h = "RISK_HALT"
+            periodic_reco = "Global risk halt dominates; fix RiskState/churn/loss machine before tuning alpha/cost thresholds."
 
     cliff_hint = "none"
     if funnel and int(funnel['risk_evaluated_total'] or 0) == 0 and int(funnel['cost_pass_total'] or 0) == 0:
@@ -413,6 +438,7 @@ def hourly_summary() -> str:
         f"BloodbathLane: {bloodbath_line}\n"
         f"BloodbathCandidatesTop: {bloodbath_candidates_line}\n"
         f"BloodbathGhost: {bloodbath_ghost_line}\n"
+        f"ParameterGovernor: {governor_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"

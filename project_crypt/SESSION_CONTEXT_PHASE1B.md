@@ -577,3 +577,42 @@ Operational rule:
 
 6) Git traceability
 - Pending commit in `phase2-working` for Bloodbath Lane implementation.
+
+---
+
+## 2026-02-25 unified 14-issue autotuner + risk-state fix wave
+1) Decision change summary
+- Implemented full operational correctness + autotuner fidelity + safe governor wave.
+- Risk halt semantics now distinguish active trigger vs cooldown (`COOLDOWN`) and keep `previous_halt_reason`.
+- Added robust ghost analytics (cost-fidelity, stratified sampling, shock tagging, robust distribution stats).
+- Added recommend-only `parameter_governor` with suspension/tail/stability gates and audit log.
+
+2) Routing/flow impact
+- `compute_shadow_risk_state(macro_shock)` now tracks:
+  - attempt churn (soft throttle), execution churn (hard halt), decayed/sliding loss pressure,
+  - explicit cooldown state machine.
+- During global halt, downstream candidates remain globally blocked (`RISK_GLOBAL_HALT`) without per-asset spam semantics.
+- Ghost simulator runs even in macro shock but rows are tagged; mutation triggers remain guarded.
+
+3) Data-structure/schema impact
+- Added/extended DB structures:
+  - `macro_state_current` (macro shock hysteresis state)
+  - `parameter_governor_log` (recommendation audit)
+  - `ghost_sim_runs` new columns: `macro_shock`, `estimated_cost_bps`, `execution_style`
+  - `risk_state_current` new columns: `previous_halt_reason`, `attempt_churn_count`, `execution_churn_count`, `loss_pressure_24h`
+
+4) Runtime/ops impact
+- MacroShock now uses entry/exit hysteresis (not always-on) and persists state in DB.
+- Bloodbath lane in shock reduces attempt caps and defaults non-fill to `EXPIRED_UNFILLED` (no taker fallback by default).
+- Hourly notifier improvements:
+  - bottleneck hard-stop override to `RISK_HALT` when appropriate,
+  - denominator-null-safe ratios with sample-size prints,
+  - richer RiskState + Governor lines.
+
+5) Validation evidence
+- Compile checks passed for aggregator + notifier.
+- Services restarted and running via watchdog.
+- Forced Telegram send successful after deployment.
+
+6) Git traceability
+- Pending commit in `phase2-working` for unified 14-issue wave.
