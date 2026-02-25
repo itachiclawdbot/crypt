@@ -649,3 +649,38 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for this 16-issue unified wave.
+
+---
+
+## 2026-02-25 churn misclassification P0 fix (event-sourced truth)
+1) Decision summary
+- Enforced strict churn contract: EXECUTION churn now only from explicit fill-like events.
+- ATTEMPT churn now emitted exactly once at last-mile attempt start; outcomes logged without double-count increment.
+- Added execution dedupe by `execution_id`; attempt dedupe by `(attempt_id,event_class)`.
+
+2) Routing/flow impact
+- BLOODBATH lane now emits:
+  - ATTEMPT_STARTED (counted), then outcome events (not counted) and optional EXECUTION(FILLED_MAKER, counted).
+- Risk machine remains event-sourced from `churn_event_log` windows (5m/60m), not legacy inferred counters.
+- Added loop guard: re-check global RiskState in attempt loop and abort with `RISK_FLIP_ABORT`.
+
+3) Data/schema impact
+- `churn_event_log` extended with `lane`, `execution_id`.
+- Added dedupe logic in logger to prevent repeated EXECUTION increments.
+
+4) Observability impact
+- Hourly ChurnDiagnostics now derived from churn_event_log source-of-truth counters:
+  - attempt 5m/60m
+  - execution 5m/60m
+  - top attempt reasons
+  - last 10 churn events
+  - penalty-box symbols
+  - CHURN_TELEMETRY_SUSPECT flag
+
+5) Validation
+- Compile checks passed.
+- Services restarted via watchdog and confirmed running.
+- Forced Telegram digest successful after fix.
+
+6) Git traceability
+- Pending commit for churn misclassification fix wave.

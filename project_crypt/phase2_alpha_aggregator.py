@@ -340,6 +340,8 @@ def init_tables() -> None:
             )
             """
         )
+        _ensure_column(c, "churn_event_log", "lane", "TEXT")
+        _ensure_column(c, "churn_event_log", "execution_id", "TEXT")
         _ensure_column(c, "ghost_sim_runs", "macro_shock", "INTEGER")
         _ensure_column(c, "ghost_sim_runs", "estimated_cost_bps", "REAL")
         _ensure_column(c, "ghost_sim_runs", "execution_style", "TEXT")
@@ -1168,12 +1170,22 @@ def _churn_params_hash(symbol: str, reason: str, extras: dict | None = None) -> 
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def log_churn_event(attempt_id: str, symbol: str, event_class: str, event_reason: str, counted: bool, extras: dict | None = None) -> None:
+def log_churn_event(attempt_id: str, symbol: str, event_class: str, event_reason: str, counted: bool, extras: dict | None = None, lane: str | None = None, execution_id: str | None = None) -> None:
     params_hash = _churn_params_hash(symbol, event_reason, extras)
     with db() as c:
-        c.execute(
-            "insert into churn_event_log (ts,attempt_id,symbol,event_class,event_reason,params_hash,counted,details_json) values (?,?,?,?,?,?,?,?)",
-            (utc_now(), attempt_id, symbol, event_class, event_reason, params_hash, int(bool(counted)), json.dumps(extras or {}, default=str)),
+        cur = c.cursor()
+        if counted:
+            if event_class == "EXECUTION" and execution_id:
+                cur.execute("select 1 from churn_event_log where event_class='EXECUTION' and execution_id=? limit 1", (execution_id,))
+                if cur.fetchone():
+                    return
+            else:
+                cur.execute("select 1 from churn_event_log where attempt_id=? and event_class=? and counted=1 limit 1", (attempt_id, event_class))
+                if cur.fetchone():
+                    return
+        cur.execute(
+            "insert into churn_event_log (ts,attempt_id,symbol,event_class,event_reason,params_hash,counted,details_json,lane,execution_id) values (?,?,?,?,?,?,?,?,?,?)",
+            (utc_now(), attempt_id, symbol, event_class, event_reason, params_hash, int(bool(counted)), json.dumps(extras or {}, default=str), lane, execution_id),
         )
 
 
@@ -1721,28 +1733,36 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
         sym = cand["symbol"]
         inst = cand["instrument_symbol"]
         attempt_id = f"BB-{sym}-{int(time.time()*1000)}-{random.randint(100,999)}"
+        log_churn_event(attempt_id, sym, "ATTEMPT", "ATTEMPT_STARTED", True, {"instrument": inst}, lane="BLOODBATH_LANE")
         if total_attempts >= max_attempts_hour:
             break
         if attempts_by_symbol.get(sym, 0) >= max_attempts_symbol:
-            log_churn_event(attempt_id, sym, "ATTEMPT", "SYMBOL_ATTEMPT_CAP", False, {"cap": max_attempts_symbol})
+            log_churn_event(attempt_id, sym, "ATTEMPT", "SYMBOL_ATTEMPT_CAP", False, {"cap": max_attempts_symbol}, lane="BLOODBATH_LANE")
             continue
         if in_penalty_box(sym):
-            log_churn_event(attempt_id, sym, "ATTEMPT", "PENALTY_BOX_BLOCK", False, {})
+            log_churn_event(attempt_id, sym, "ATTEMPT", "PENALTY_BOX_BLOCK", False, {}, lane="BLOODBATH_LANE")
             continue
         if consec_losses >= BLOODBATH_LANE_CONSEC_LOSS_LIMIT:
             out["active"] = False
             out["reason"] = "LANE_CONSEC_LOSS_COOLDOWN"
             break
+        # retry-loop guard: re-check global risk state before each last-mile attempt
+        rs_now = load_risk_state()
+        if rs_now.get("halted"):
+            log_churn_event(attempt_id, sym, "ATTEMPT", "RISK_FLIP_ABORT", False, {"halt_reason": rs_now.get("halt_reason")}, lane="BLOODBATH_LANE")
+            out["active"] = False
+            out["reason"] = "GLOBAL_RISK_HALTED"
+            break
         try:
             cd = get_json(f"https://api.crypto.com/exchange/v1/public/get-candlestick?instrument_name={inst}&timeframe=5m")
             rows = cd.get("result", {}).get("data", []) if isinstance(cd, dict) else []
             if len(rows) < 3:
-                log_churn_event(attempt_id, sym, "ATTEMPT", "STALE_BOOK_ABORT", True, {"rows": len(rows)})
+                log_churn_event(attempt_id, sym, "ATTEMPT", "STALE_BOOK_ABORT", False, {"rows": len(rows)}, lane="BLOODBATH_LANE")
                 continue
             entry = float(rows[-2].get("o") or 0.0)
             exitp = float(rows[-1].get("c") or 0.0)
             if entry <= 0 or exitp <= 0:
-                log_churn_event(attempt_id, sym, "ATTEMPT", "PRICE_CHASE_ABORT", True, {"entry": entry, "exit": exitp})
+                log_churn_event(attempt_id, sym, "ATTEMPT", "PRICE_CHASE_ABORT", False, {"entry": entry, "exit": exitp}, lane="BLOODBATH_LANE")
                 continue
             m = micro_latest.get(sym, {})
             spread = float(m.get("spread_bps_p95_300", 20.0) or 20.0)
@@ -1772,16 +1792,17 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             total_attempts += 1
             attempts_made += 1
             if expired_unfilled:
-                log_churn_event(attempt_id, sym, "ATTEMPT", "EXPIRED_UNFILLED", True, {"p_fill": p_fill})
+                log_churn_event(attempt_id, sym, "ATTEMPT", "EXPIRED_UNFILLED", False, {"p_fill": p_fill}, lane="BLOODBATH_LANE")
             else:
-                log_churn_event(attempt_id, sym, "ATTEMPT", "FILLED_MAKER", True, {"p_fill": p_fill})
-                log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": net})
+                log_churn_event(attempt_id, sym, "ATTEMPT", "FILLED_MAKER", False, {"p_fill": p_fill}, lane="BLOODBATH_LANE")
+                execution_id = f"GF-{sym}-{attempt_id}"
+                log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": net}, lane="BLOODBATH_LANE", execution_id=execution_id)
             if net < 0 and not expired_unfilled:
                 consec_losses += 1
             elif not expired_unfilled:
                 consec_losses = 0
         except Exception as e:
-            log_churn_event(attempt_id, sym, "ATTEMPT", "VENUE_ERROR", True, {"error": str(e)[:160]})
+            log_churn_event(attempt_id, sym, "ATTEMPT", "VENUE_ERROR", False, {"error": str(e)[:160]}, lane="BLOODBATH_LANE")
             continue
 
     next_state = {

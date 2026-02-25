@@ -262,6 +262,21 @@ def hourly_summary() -> str:
         )
         ghost_rows = cur.fetchall()
 
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1", (since,))
+        attempt_60m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=datetime('now','-5 minutes') and event_class='ATTEMPT' and counted=1")
+        attempt_5m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_class='EXECUTION' and counted=1", (since,))
+        exec_60m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=datetime('now','-5 minutes') and event_class='EXECUTION' and counted=1")
+        exec_5m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select event_reason,count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by event_reason order by c desc limit 3", (since,))
+        top_attempt_reasons = cur.fetchall()
+        cur.execute("select ts,event_class,symbol,event_reason,coalesce(lane,'-') lane from churn_event_log order by id desc limit 10")
+        last_churn_events = cur.fetchall()
+        cur.execute("select symbol,until_ts from symbol_penalty_box where until_ts > ? order by until_ts asc limit 8", (datetime.now(timezone.utc).isoformat(),))
+        penalty_rows = cur.fetchall()
+
         periodic_analysis_txt_6h, bottleneck_6h, periodic_reco = _periodic_analysis(cur, since_6h, 72, "6h")
     periodic_analysis_txt_1h, bottleneck_1h, _ = _periodic_analysis(cur, since, 24, "1h")
 
@@ -312,6 +327,9 @@ def hourly_summary() -> str:
             continue
     cost_breakdown_txt = ", ".join(f"{k}:{v}" for k, v in cost_breakdown.items())
     ghost_txt = ", ".join(f"{r['reject_reason']}({r['c']},avg={float(r['a'] or 0):.1f})" for r in ghost_rows) or "none"
+    churn_top_reasons_line = ", ".join(f"{r['event_reason']}:{r['c']}" for r in top_attempt_reasons) or "none"
+    churn_last_events_line = " | ".join(f"{r['ts']}:{r['event_class']}:{r['symbol']}:{r['event_reason']}:{r['lane']}" for r in last_churn_events) or "none"
+    penalty_symbols_line = ", ".join(f"{r['symbol']}@{r['until_ts']}" for r in penalty_rows) or "none"
     best_liq_txt = ", ".join(f"{r['base_symbol']}({r['liquidity_score']:.1f}x)" for r in best_liq if r['base_symbol'] not in {'USDT','USDC','USD','EUR'}) or "none"
     if safety_components['n'] > 0:
         safety_line = (
@@ -340,6 +358,9 @@ def hourly_summary() -> str:
     bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
+    churn_top_reasons_line = "none"
+    churn_last_events_line = "none"
+    penalty_symbols_line = "none"
     sources_present_txt = "{}"
 
     if funnel:
@@ -397,11 +418,13 @@ def hourly_summary() -> str:
             f"mean={float(gm.get('mean', 0.0) or 0.0):.1f} p5={float(gm.get('p5', 0.0) or 0.0):.1f}"
         )
         rd = rs.get('details', {}) or {}
+        risk_eval_n = int(funnel['risk_evaluated_total'] or 0)
+        suspect = bool(exec_60m > max(5, risk_eval_n * 3) or (attempt_60m == 0 and risk_eval_n > 0 and exec_60m > 0))
         churn_diag_line = (
-            f"attempt5m={int(rd.get('attempt_churn_5m', 0) or 0)} attempt60m={int(rs.get('attempt_churn_count', 0) or 0)} "
-            f"exec5m={int(rd.get('execution_churn_5m', 0) or 0)} exec60m={int(rs.get('execution_churn_count', 0) or 0)} "
+            f"attempt5m={attempt_5m} attempt60m={attempt_60m} "
+            f"exec5m={exec_5m} exec60m={exec_60m} "
             f"penalty_symbols={int(rd.get('unique_penalty_symbols', 0) or 0)} hot_loop={bool(rd.get('hot_loop', False))} "
-            f"suspect={bool(rd.get('churn_telemetry_suspect', False))}"
+            f"suspect={suspect}"
         )
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
@@ -451,6 +474,9 @@ def hourly_summary() -> str:
         f"BloodbathGhost: {bloodbath_ghost_line}\n"
         f"ParameterGovernor: {governor_line}\n"
         f"ChurnDiagnostics: {churn_diag_line}\n"
+        f"ChurnTopReasons: {churn_top_reasons_line}\n"
+        f"ChurnLast10: {churn_last_events_line}\n"
+        f"PenaltyBoxSymbols: {penalty_symbols_line}\n"
         f"Sources present: {sources_present_txt}\n"
         f"Top Watchlist: {watch_txt}\n"
         f"Top Eligible: {eligible_txt}\n"
