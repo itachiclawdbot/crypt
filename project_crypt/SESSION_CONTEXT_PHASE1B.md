@@ -690,3 +690,37 @@ Operational rule:
 - Retry loop now re-checks global RiskState in-loop and aborts with `RISK_FLIP_ABORT`.
 - Added finer attempt failure classification for exceptions: `RATE_LIMIT`, `API_TIMEOUT`, `VENUE_ERROR`.
 - Kept event idempotency behavior (attempt/execution dedupe) intact.
+
+---
+
+## 2026-02-26 unified reliability/risk/tuner consolidation
+1) Decision change summary
+- Consolidated event-sourced churn correctness with retry safety and stricter execution classification.
+- Aligned BLOODBATH lane activation semantics with macro/regime reasons and added lane reject diagnostics.
+- Fixed DD paradox by decoupling portfolio DD basis from ghost-research PnL (shadow ledger basis).
+- Improved governor trust metrics with validity/extreme classification and stats metadata.
+
+2) Routing/flow impact
+- Churn counters now derive from `churn_event_log` (ATTEMPT/EXECUTION 5m/60m).
+- Last-mile fetch path now uses retry wrapper with in-loop risk re-check (`RISK_FLIP_ABORT`).
+- Lane now outputs explicit `activation_reasons` and reject breakdown categories.
+
+3) Data structure/schema impact
+- Added tables: `shadow_portfolio_ledger`, `ghost_stats_meta`, `audit_state_change_log`.
+- Added churn event fields: `lane`, `execution_id`.
+- Added ghost validity fields: `invalid_reason`, `extreme_class`, `valid_for_governor`.
+
+4) Runtime/ops impact
+- Hourly digest now includes:
+  - DD basis/value line (shadow ledger)
+  - Bloodbath reject breakdown
+  - Churn diagnostics from source-of-truth event log
+- Watchdog + notifier guard retained.
+
+5) Validation evidence
+- Compile checks passed.
+- Services restarted and verified running.
+- Forced Telegram digest succeeded.
+
+6) Git traceability
+- Pending commit for unified reliability/risk/tuner consolidation.

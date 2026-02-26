@@ -356,6 +356,8 @@ def hourly_summary() -> str:
     bloodbath_line = "LaneActive=False reason=- attempts_hour=0"
     bloodbath_candidates_line = "none"
     bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
+    bloodbath_reject_line = "none"
+    dd_line = "dd_basis=shadow_ledger dd_1h=0.0 dd_24h=0.0"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
     churn_top_reasons_line = "none"
@@ -398,18 +400,20 @@ def hourly_summary() -> str:
         m = sj.get('macro_shock', {}) or {}
         macro_line = f"macro_shock={bool(m.get('macro_shock', False))} btc_1h_abs={m.get('btc_ret_1h_abs', 0)} news_velocity={m.get('news_velocity', 0)}"
         bb = sj.get('bloodbath_lane', {}) or {}
-        bloodbath_line = f"LaneActive={bool(bb.get('active', False))} reason={bb.get('reason', '-')} attempts_hour={int(bb.get('attempts_hour', 0) or 0)}"
+        bloodbath_line = f"LaneActive={bool(bb.get('active', False))} reason={bb.get('reason', '-')} reasons={bb.get('activation_reasons', [])} attempts_hour={int(bb.get('attempts_hour', 0) or 0)} majors_eval={int(bb.get('majors_evaluated', 0) or 0)}"
         cands = bb.get('candidates_top', []) or []
         bloodbath_candidates_line = ", ".join(
             f"{x.get('symbol')}[pc={x.get('pressure_confidence')},ss={x.get('spread_stability')},util={x.get('utilization')}]" for x in cands[:3]
         ) or "none"
         g1 = bb.get('ghost_1h', {}) or {}
         g24 = bb.get('ghost_24h', {}) or {}
+        bloodbath_reject_line = str(bb.get('reject_breakdown', {}))
         bloodbath_ghost_line = (
             f"1h:trades={int(g1.get('trades', 0) or 0)} net={float(g1.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g1.get('winrate', 0.0) or 0.0):.2f}"
             f" fill={float(g1.get('fill_rate', 0.0) or 0.0):.2f} expired={float(g1.get('expired_rate', 0.0) or 0.0):.2f} cond_fill_pnl={float(g1.get('pnl_conditional_on_fill', 0.0) or 0.0):.1f}"
             f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
         )
+        dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         governor_line = (
@@ -471,7 +475,9 @@ def hourly_summary() -> str:
         f"MacroShock: {macro_line}\n"
         f"BloodbathLane: {bloodbath_line}\n"
         f"BloodbathCandidatesTop: {bloodbath_candidates_line}\n"
+        f"BloodbathRejectBreakdown: {bloodbath_reject_line}\n"
         f"BloodbathGhost: {bloodbath_ghost_line}\n"
+        f"DDState: {dd_line}\n"
         f"ParameterGovernor: {governor_line}\n"
         f"ChurnDiagnostics: {churn_diag_line}\n"
         f"ChurnTopReasons: {churn_top_reasons_line}\n"

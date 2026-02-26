@@ -342,11 +342,50 @@ def init_tables() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_portfolio_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT,
+                lane TEXT,
+                fill_id TEXT UNIQUE,
+                execution_style_intent TEXT,
+                realized_pnl_bps REAL,
+                details_json TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ghost_stats_meta (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                version INTEGER NOT NULL,
+                updated_ts TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_state_change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                entity TEXT,
+                entity_id TEXT,
+                from_state TEXT,
+                to_state TEXT,
+                reason TEXT
+            )
+            """
+        )
         _ensure_column(c, "churn_event_log", "lane", "TEXT")
         _ensure_column(c, "churn_event_log", "execution_id", "TEXT")
         _ensure_column(c, "ghost_sim_runs", "macro_shock", "INTEGER")
         _ensure_column(c, "ghost_sim_runs", "estimated_cost_bps", "REAL")
         _ensure_column(c, "ghost_sim_runs", "execution_style", "TEXT")
+        _ensure_column(c, "ghost_sim_runs", "invalid_reason", "TEXT")
+        _ensure_column(c, "ghost_sim_runs", "extreme_class", "TEXT")
+        _ensure_column(c, "ghost_sim_runs", "valid_for_governor", "INTEGER")
         _ensure_column(c, "risk_state_current", "previous_halt_reason", "TEXT")
         _ensure_column(c, "risk_state_current", "attempt_churn_count", "INTEGER")
         _ensure_column(c, "risk_state_current", "execution_churn_count", "INTEGER")
@@ -1122,7 +1161,7 @@ def tradable_autotuner_stats(hours: int = 24) -> dict:
             """
             select reject_reason, net_pnl_bps
             from ghost_sim_runs
-            where ts>=? and instrument_symbol like '%_%'
+            where ts>=? and instrument_symbol like '%_%' and coalesce(valid_for_governor,1)=1
             """,
             (since,),
         )
@@ -1353,16 +1392,18 @@ def load_risk_state() -> dict:
         }
 
 
-def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
+def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL") -> dict:
     now = datetime.now(timezone.utc)
     window_minutes = int(os.getenv("PHASE2_RISK_WINDOW_MIN", "60"))
     cooldown_sec = int(os.getenv("PHASE2_RISK_COOLDOWN_SEC", "3600"))
     attempt_churn_limit = int(os.getenv("PHASE2_RISK_ATTEMPT_CHURN_LIMIT", "22"))
     execution_churn_limit = int(os.getenv("PHASE2_RISK_EXEC_CHURN_LIMIT", "14"))
-    consec_loss_limit = int(os.getenv("PHASE2_RISK_CONSEC_LOSS_LIMIT", "8"))
-
+    if regime == "VOLATILE":
+        attempt_churn_limit = int(attempt_churn_limit * 1.25)
     if macro_shock:
-        attempt_churn_limit = max(6, int(attempt_churn_limit * 0.7))
+        attempt_churn_limit = int(attempt_churn_limit * 1.5)
+        execution_churn_limit = int(execution_churn_limit * 1.2)
+    consec_loss_limit = int(os.getenv("PHASE2_RISK_CONSEC_LOSS_LIMIT", "8"))
 
     since = (now - timedelta(minutes=window_minutes)).isoformat()
     since_5m = (now - timedelta(minutes=5)).isoformat()
@@ -1528,6 +1569,17 @@ def compute_shadow_risk_state(macro_shock: bool = False) -> dict:
     return state
 
 
+def _ghost_stats_meta() -> dict:
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select version,updated_ts from ghost_stats_meta where id=1")
+        r = cur.fetchone()
+        if not r:
+            c.execute("insert into ghost_stats_meta (id,version,updated_ts) values (1,1,?)", (utc_now(),))
+            return {"version": 1, "updated_ts": utc_now()}
+        return {"version": int(r[0] or 1), "updated_ts": str(r[1] or utc_now())}
+
+
 def parameter_governor_recommend(summary: dict, autotuner_stats: dict, risk_state: dict, macro: dict) -> dict:
     halted = bool(risk_state.get("halted", False))
     shock = bool(macro.get("macro_shock", False))
@@ -1557,18 +1609,30 @@ def parameter_governor_recommend(summary: dict, autotuner_stats: dict, risk_stat
         suspend_reasons.append("WINDOW_UNSTABLE")
     can_loosen = bool((not suspend) and stable and n >= PHASE2_AUTOTUNER_MIN_N and mean > 0 and sortino >= PHASE2_AUTOTUNER_MIN_SORTINO)
 
+    with db() as c:
+        cur = c.cursor()
+        cur.execute("select count(*), sum(case when coalesce(valid_for_governor,1)=1 then 1 else 0 end) from ghost_sim_runs where ts>=?", ((datetime.now(timezone.utc)-timedelta(hours=24)).isoformat(),))
+        total_rows, valid_rows = cur.fetchone()
+        valid_rate = float(valid_rows or 0) / max(1, int(total_rows or 0))
+        cur.execute("select coalesce(extreme_class,'NORMAL') cls, count(*) c from ghost_sim_runs where ts>=? group by cls", ((datetime.now(timezone.utc)-timedelta(hours=24)).isoformat(),))
+        class_counts = {str(r[0]): int(r[1] or 0) for r in cur.fetchall()}
+    meta = _ghost_stats_meta()
+
     rec = {
         "mode": "recommend_only" if not PHASE2_AUTOTUNER_APPLY else "apply_enabled",
         "namespace": "core",
         "suspended": suspend,
         "suspend_reasons": suspend_reasons,
         "suspend_reason": ",".join(suspend_reasons) if suspend_reasons else None,
+        "ghost_stats_version": meta.get("version", 1),
         "metrics": {
             "n": n,
             "mean": round(mean, 2),
             "hit_rate": round(hit, 3),
             "p5": round(p5, 2),
             "sortino_proxy": round(sortino, 3),
+            "valid_rate": round(valid_rate, 3),
+            "class_counts": class_counts,
         },
         "recommendations": [],
         "bounds": {
@@ -1646,8 +1710,11 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
     out = {
         "active": False,
         "reason": "disabled",
+        "activation_reasons": [],
         "attempts_hour": 0,
         "attempts_by_symbol": {},
+        "majors_evaluated": 0,
+        "reject_breakdown": {"pressure_confidence_fail": 0, "spread_stability_fail": 0, "utilization_fail": 0, "depth_curve_fail": 0},
         "candidates_top": [],
         "ghost_1h": {"trades": 0, "net_pnl_bps": 0.0, "winrate": 0.0},
         "ghost_24h": {"trades": 0, "net_pnl_bps": 0.0, "winrate": 0.0},
@@ -1662,7 +1729,12 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
         out["reason"] = "SOFT_THROTTLE"
         return out
 
-    is_shock = bool(macro.get("macro_shock", False) or regime == "VOLATILE")
+    activation_reasons = []
+    if bool(macro.get("macro_shock", False)):
+        activation_reasons.append("MACRO_SHOCK")
+    if regime == "VOLATILE":
+        activation_reasons.append("VOLATILE")
+    is_shock = bool(activation_reasons)
     active_until = lane_state.get("active_until")
     active_hysteresis = False
     if active_until:
@@ -1687,7 +1759,8 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
             pass
 
     out["active"] = True
-    out["reason"] = "MACRO_SHOCK" if is_shock else "HYSTERESIS"
+    out["activation_reasons"] = activation_reasons if activation_reasons else (["HYSTERESIS"] if active_hysteresis else [])
+    out["reason"] = "+".join(out["activation_reasons"]) if out["activation_reasons"] else "HYSTERESIS"
 
     max_attempts_hour = BLOODBATH_MAX_ATTEMPTS_PER_HOUR
     max_attempts_symbol = BLOODBATH_MAX_ATTEMPTS_PER_SYMBOL_HOUR
@@ -1733,14 +1806,23 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
         base = inst.split("_")[0]
         micro = micro_latest.get(base, {})
         venue = venue_metrics.get(base, {})
+        out["majors_evaluated"] += 1
         if not micro:
+            out["reject_breakdown"]["depth_curve_fail"] += 1
             continue
         spread = float(micro.get("spread_bps_p95_300", venue.get("spread_bps", 9999.0)) or 9999.0)
         spread_stability = float(micro.get("spread_stability", 0.0) or 0.0)
         pressure_conf = float(micro.get("pressure_confidence", 0.0) or 0.0)
         depth20 = float(micro.get("depth_usd_20bps", 0.0) or 0.0)
         utilization = min(1.0, depth20 / max(1.0, TARGET_NOTIONAL_USDT))
-        if pressure_conf < BLOODBATH_PRESSURE_CONF_MIN or spread > BLOODBATH_SPREAD_MAX_BPS or spread_stability < 0.45 or utilization < BLOODBATH_MIN_UTILIZATION:
+        if pressure_conf < BLOODBATH_PRESSURE_CONF_MIN:
+            out["reject_breakdown"]["pressure_confidence_fail"] += 1
+            continue
+        if spread_stability < 0.45 or spread > BLOODBATH_SPREAD_MAX_BPS:
+            out["reject_breakdown"]["spread_stability_fail"] += 1
+            continue
+        if utilization < BLOODBATH_MIN_UTILIZATION:
+            out["reject_breakdown"]["utilization_fail"] += 1
             continue
         candidates.append({
             "symbol": base,
@@ -1827,6 +1909,11 @@ def run_bloodbath_lane(regime: str, macro: dict, risk_state: dict, venue_metrics
                 log_churn_event(attempt_id, sym, "ATTEMPT", "FILLED_MAKER", False, {"p_fill": p_fill}, lane="BLOODBATH_LANE")
                 execution_id = f"GF-{sym}-{attempt_id}"
                 log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": net}, lane="BLOODBATH_LANE", execution_id=execution_id)
+                with db() as _lc:
+                    _lc.execute(
+                        "insert or ignore into shadow_portfolio_ledger (ts,symbol,lane,fill_id,execution_style_intent,realized_pnl_bps,details_json) values (?,?,?,?,?,?,?)",
+                        (utc_now(), sym, "BLOODBATH_LANE", execution_id, "MAKER_POST_ONLY", float(net), json.dumps({"attempt_id": attempt_id}, default=str)),
+                    )
             if net < 0 and not expired_unfilled:
                 consec_losses += 1
             elif not expired_unfilled:
@@ -1920,12 +2007,26 @@ def run_ghost_simulator(macro_shock: bool = False) -> dict:
                 pnl_bps = ((exitp - entry) / entry) * 10000.0
                 costs_bps = est_cost
                 net = pnl_bps - costs_bps
+                invalid_reason = None
+                extreme_class = "NORMAL"
+                valid_for_governor = 1
+                if any(v is None for v in [entry, exitp]) or entry <= 0 or exitp <= 0:
+                    invalid_reason = "DATA_MISSING"
+                    extreme_class = "DATA_MISSING"
+                    valid_for_governor = 0
+                elif net <= -9000:
+                    extreme_class = "UNVERIFIED_EXTREME"
+                    valid_for_governor = 0
+                elif net <= -1500:
+                    extreme_class = "REAL_CRASH"
+                elif net <= -700:
+                    extreme_class = "LIQUIDITY_DEATH"
                 cur.execute(
                     """
-                    insert into ghost_sim_runs (ts,instrument_symbol,entry_ts,exit_ts,horizon,entry_price,exit_price,pnl_bps,costs_bps,net_pnl_bps,reject_reason,features_ref,macro_shock,estimated_cost_bps,execution_style)
-                    values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    insert into ghost_sim_runs (ts,instrument_symbol,entry_ts,exit_ts,horizon,entry_price,exit_price,pnl_bps,costs_bps,net_pnl_bps,reject_reason,features_ref,macro_shock,estimated_cost_bps,execution_style,invalid_reason,extreme_class,valid_for_governor)
+                    values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (utc_now(), inst, r[1], utc_now(), "5m", entry, exitp, pnl_bps, costs_bps, net, reason, None, int(bool(macro_shock)), est_cost, exec_style),
+                    (utc_now(), inst, r[1], utc_now(), "5m", entry, exitp, pnl_bps, costs_bps, net, reason, None, int(bool(macro_shock)), est_cost, exec_style, invalid_reason, extreme_class, valid_for_governor),
                 )
                 rows_done += 1
                 by_reason[reason] += 1
@@ -1988,7 +2089,7 @@ def run_cycle() -> dict:
     obi_threshold = obi_threshold_for_regime(regime)
     pressure_count = 0
     macro = detect_macro_shock(regime, news_hits, venue_metrics)
-    risk_state = compute_shadow_risk_state(bool(macro.get("macro_shock", False)))
+    risk_state = compute_shadow_risk_state(bool(macro.get("macro_shock", False)), regime)
     bloodbath = run_bloodbath_lane(regime, macro, risk_state, venue_metrics, micro_latest, base_to_instrument)
 
     alpha_scored_count = 0
@@ -2327,13 +2428,13 @@ def run_cycle() -> dict:
                     else:
                         with db() as _c:
                             _cur = _c.cursor()
-                            _cur.execute("select avg(net_pnl_bps) from ghost_sim_runs where ts >= datetime('now','-1 hour')")
+                            _cur.execute("select coalesce(sum(realized_pnl_bps),0) from shadow_portfolio_ledger where ts >= datetime('now','-1 hour')")
                             hourly_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
-                            _cur.execute("select avg(net_pnl_bps) from ghost_sim_runs where ts >= datetime('now','-24 hours')")
+                            _cur.execute("select coalesce(sum(realized_pnl_bps),0) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours')")
                             daily_pnl = float((_cur.fetchone() or [0])[0] or 0.0)
-                        if daily_pnl <= -40:
+                        if daily_pnl <= -80:
                             risk_reason_code = "RISK_DD_DAILY"
-                        elif hourly_pnl <= -20:
+                        elif hourly_pnl <= -30:
                             risk_reason_code = "RISK_DD_HOURLY"
 
                     if risk_reason_code:
@@ -2472,6 +2573,12 @@ def run_cycle() -> dict:
         micro_interest_total = len(mu.get("interest_symbols", []) or [])
     except Exception:
         pass
+    with db() as _cdd:
+        _cur = _cdd.cursor()
+        _cur.execute("select coalesce(sum(realized_pnl_bps),0) from shadow_portfolio_ledger where ts >= datetime('now','-1 hour')")
+        dd_hourly = float((_cur.fetchone() or [0])[0] or 0.0)
+        _cur.execute("select coalesce(sum(realized_pnl_bps),0) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours')")
+        dd_daily = float((_cur.fetchone() or [0])[0] or 0.0)
     sanity = {
         "micro_target_k": micro_target_k,
         "pre_cost_skip_breakdown": dict(pre_cost_skip),
@@ -2491,6 +2598,9 @@ def run_cycle() -> dict:
         },
         "micro_join_fail": micro_join_fail,
         "risk_reason_codes": dict(risk_code_counter),
+        "dd_basis": "shadow_ledger",
+        "dd_hourly_bps": round(dd_hourly, 2),
+        "dd_daily_bps": round(dd_daily, 2),
         "risk_state": risk_state,
         "macro_shock": macro,
         "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),

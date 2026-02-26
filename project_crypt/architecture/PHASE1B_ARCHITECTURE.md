@@ -173,3 +173,23 @@ Phase-1B design docs:
 - No ToS-violating scraping route.
 - Kill-switch remains hard-stop at highest priority.
 - All important actions must be auditable in local logs.
+
+---
+
+## 2026-02-26 Routing/State-machine updates (Reliability + Risk/Tuner correctness)
+- Churn telemetry is now **event-sourced** from `churn_event_log` only.
+  - `ATTEMPT` = one per last-mile attempt start (dedup by `attempt_id,event_class`)
+  - `EXECUTION` = only accepted/fill events (dedup by `execution_id`)
+- Added tiered churn safety routing:
+  - Symbol penalty box (`symbol_penalty_box`)
+  - Systemic halt trigger by unique penalty-boxed symbols
+  - Hot-loop signature detector `(symbol+reason+params_hash)`
+- Macro/lane consistency routing:
+  - Bloodbath lane now emits `activation_reasons` list and reason labels aligned with macro/regime state.
+  - Lane reject breakdown exported for observability.
+- DD risk basis decoupling:
+  - Portfolio DD now reads `shadow_portfolio_ledger` (execution-like fills only).
+  - Ghost research PnL is analytics-only and not circuit-breaker input.
+- Governor fidelity updates:
+  - ghost invalid/extreme classification fields added (`invalid_reason`, `extreme_class`, `valid_for_governor`).
+  - governor metrics now expose `valid_rate`, class counts, and stats-version metadata.
