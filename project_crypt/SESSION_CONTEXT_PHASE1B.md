@@ -724,3 +724,42 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for unified reliability/risk/tuner consolidation.
+
+---
+
+## 2026-02-26 capacity routing + actionable shadow execution wave
+1) Decision change summary
+- Fixed batch-capacity mislabeling by separating true position-full vs overflow capacity in-candidate batch.
+- Added mandatory ACTIONABLE -> shadow execution attempts for core lane (no proposal-only dead-end).
+- Added compact OpenPositions/Capacity/ShadowExec lines to hourly for operator validation.
+
+2) Routing/flow impact
+- Capacity logic now uses `open_positions` from shadow ledger and `remaining_slots`.
+- New reason semantics:
+  - `RISK_MAX_POSITIONS` only when ledger truly full (`open_positions >= max_positions`)
+  - `RISK_CAPACITY_FULL` for overflow beyond remaining slots in current batch.
+- ACTIONABLE core candidates now emit ATTEMPT start and terminal outcome (`FILLED_MAKER`/`EXPIRED_UNFILLED`).
+
+3) Data/schema impact
+- No new tables in this wave; reused `shadow_portfolio_ledger` + `churn_event_log`.
+- Added summary/sanity fields for capacity and shadow execution counters.
+
+4) Runtime/ops impact
+- Hourly now prints:
+  - `OpenPositions basis/open/max/remaining_slots`
+  - `Capacity admitted/capacity_rejected`
+  - `shadow_attempts/shadow_fills/shadow_expired`
+- Governor compact line remains visible with tail/validity metrics.
+
+5) Validation evidence
+- Compile checks passed.
+- Services restarted and running.
+- Forced Telegram send succeeded.
+- Live validation snapshot after cycle:
+  - OpenPositions basis=shadow_ledger open=0 max=3 remaining_slots=3
+  - Capacity admitted=3 capacity_rejected=89
+  - shadow_attempts=3 shadow_fills=3 shadow_expired=0
+  - Risk reason codes include `RISK_CAPACITY_FULL` and no false `RISK_MAX_POSITIONS` flood.
+
+6) Git traceability
+- Pending commit for capacity+shadow-exec wave.

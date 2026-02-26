@@ -2076,6 +2076,9 @@ def run_cycle() -> dict:
     risk_pass_count = 0
     cost_pass_count = 0
     proposed_count = 0
+    shadow_attempts = 0
+    shadow_fills = 0
+    shadow_expired = 0
     reject_counter: Counter = Counter()
     rejects_tradable: Counter = Counter()
     rejects_external: Counter = Counter()
@@ -2091,6 +2094,17 @@ def run_cycle() -> dict:
     macro = detect_macro_shock(regime, news_hits, venue_metrics)
     risk_state = compute_shadow_risk_state(bool(macro.get("macro_shock", False)), regime)
     bloodbath = run_bloodbath_lane(regime, macro, risk_state, venue_metrics, micro_latest, base_to_instrument)
+
+    max_positions_normal = int(os.getenv("PHASE2_MAX_CONCURRENT_NORMAL", "10"))
+    max_positions_volatile = int(os.getenv("PHASE2_MAX_CONCURRENT_VOLATILE", "3"))
+    max_positions = max_positions_volatile if regime == "VOLATILE" else max_positions_normal
+    with db() as _pc:
+        _cur = _pc.cursor()
+        _cur.execute("select count(distinct symbol) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours')")
+        open_positions = int((_cur.fetchone() or [0])[0] or 0)
+    remaining_slots = max(0, max_positions - open_positions)
+    capacity_admitted = 0
+    capacity_rejected = 0
 
     alpha_scored_count = 0
     cost_evaluated_count = 0
@@ -2312,15 +2326,16 @@ def run_cycle() -> dict:
             status = "ELIGIBLE"
 
             # Early/static risk checks (cheap filters)
-            max_positions_normal = int(os.getenv("PHASE2_MAX_CONCURRENT_NORMAL", "10"))
-            max_positions_volatile = int(os.getenv("PHASE2_MAX_CONCURRENT_VOLATILE", "3"))
-            max_positions = max_positions_volatile if regime == "VOLATILE" else max_positions_normal
             max_symbol_concentration = int(os.getenv("PHASE2_MAX_SYMBOL_CONCENTRATION", "1"))
             current_same_symbol = sum(1 for r in actionable_list if r.get("symbol") == sym)
             early_risk_block = None
-            if proposed_count >= max_positions:
+            if open_positions >= max_positions:
                 early_risk_block = "RISK_MAX_POSITIONS"
-                log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "regime": regime, "check_phase": "early"})
+                log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "open_positions": open_positions, "regime": regime, "check_phase": "early"})
+            elif capacity_admitted >= remaining_slots:
+                early_risk_block = "RISK_CAPACITY_FULL"
+                capacity_rejected += 1
+                log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "open_positions": open_positions, "remaining_slots": remaining_slots, "check_phase": "early"})
             elif current_same_symbol >= max_symbol_concentration:
                 early_risk_block = "RISK_CONCENTRATION"
                 log_reject(sym, "risk", early_risk_block, {"symbol": sym, "max_symbol_concentration": max_symbol_concentration, "check_phase": "early"})
@@ -2450,6 +2465,7 @@ def run_cycle() -> dict:
                     else:
                         risk_pass_count += 1
                         proposed_count += 1
+                        capacity_admitted += 1
                         stage_reached = "actionable"
                         status = "ACTIONABLE"
                         notional_util_samples.append(target_notional_adj / max(1.0, TARGET_NOTIONAL_USDT))
@@ -2463,6 +2479,28 @@ def run_cycle() -> dict:
                             "risk_flags": risk_flags,
                             "new_listing": is_new_listing,
                         }, conviction="high")
+
+                        # enforce ACTIONABLE -> shadow execution attempt
+                        attempt_id = f"CORE-{sym}-{int(time.time()*1000)}-{random.randint(100,999)}"
+                        shadow_attempts += 1
+                        log_churn_event(attempt_id, sym, "ATTEMPT", "ATTEMPT_STARTED", True, {
+                            "lane": "CORE",
+                            "execution_style_intent": "MAKER_POST_ONLY" if chosen_style == "maker-first" else "TAKER",
+                            "maker_time_budget_sec": maker_time_budget_sec,
+                        }, lane="CORE")
+                        filled = bool(chosen_style == "maker-first" and p_fill_maker >= 0.45)
+                        if filled:
+                            execution_id = f"CF-{sym}-{attempt_id}"
+                            shadow_fills += 1
+                            log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": cost_edge_bps}, lane="CORE", execution_id=execution_id)
+                            with db() as _lc:
+                                _lc.execute(
+                                    "insert or ignore into shadow_portfolio_ledger (ts,symbol,lane,fill_id,execution_style_intent,realized_pnl_bps,details_json) values (?,?,?,?,?,?,?)",
+                                    (utc_now(), sym, "CORE", execution_id, "MAKER_POST_ONLY", float(cost_edge_bps), json.dumps({"attempt_id": attempt_id}, default=str)),
+                                )
+                        else:
+                            shadow_expired += 1
+                            log_churn_event(attempt_id, sym, "ATTEMPT", "EXPIRED_UNFILLED", False, {"lane": "CORE"}, lane="CORE")
 
         if sym in {"USDT", "USDC", "USD", "EUR"}:
             invalid_assets_filtered += 1
@@ -2598,6 +2636,15 @@ def run_cycle() -> dict:
         },
         "micro_join_fail": micro_join_fail,
         "risk_reason_codes": dict(risk_code_counter),
+        "open_positions_basis": "shadow_ledger",
+        "open_positions": open_positions,
+        "max_positions": max_positions,
+        "remaining_slots": remaining_slots,
+        "capacity_admitted": capacity_admitted,
+        "capacity_rejected": capacity_rejected,
+        "shadow_attempts": shadow_attempts,
+        "shadow_fills": shadow_fills,
+        "shadow_expired": shadow_expired,
         "dd_basis": "shadow_ledger",
         "dd_hourly_bps": round(dd_hourly, 2),
         "dd_daily_bps": round(dd_daily, 2),

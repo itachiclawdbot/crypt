@@ -193,3 +193,9 @@ Phase-1B design docs:
 - Governor fidelity updates:
   - ghost invalid/extreme classification fields added (`invalid_reason`, `extreme_class`, `valid_for_governor`).
   - governor metrics now expose `valid_rate`, class counts, and stats-version metadata.
+
+### 2026-02-26 Capacity routing update
+- Risk capacity gate now routes through ledger-based open-position state:
+  - `RISK_MAX_POSITIONS` = ledger full
+  - `RISK_CAPACITY_FULL` = batch overflow vs remaining slots
+- Actionable routing now includes mandatory shadow execution attempt path (core lane), producing ATTEMPT/EXECUTION telemetry and shadow ledger updates.

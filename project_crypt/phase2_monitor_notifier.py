@@ -357,8 +357,11 @@ def hourly_summary() -> str:
     bloodbath_candidates_line = "none"
     bloodbath_ghost_line = "1h:trades=0 net=0.0 win=0.0 | 24h:trades=0 net=0.0 win=0.0"
     bloodbath_reject_line = "none"
-    dd_line = "dd_basis=shadow_ledger dd_1h=0.0 dd_24h=0.0"
-    governor_line = "mode=recommend_only suspended=True reasons=[] n=0"
+    dd_line = "dd_basis=shadow_ledger fills_24h=0 dd_1h=0.0 dd_24h=0.0 limit=80"
+    openpos_line = "OpenPositions basis=shadow_ledger open=0 max=0 remaining_slots=0"
+    capacity_line = "Capacity admitted=0 capacity_rejected=0"
+    shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0"
+    governor_line = "mode=recommend_only suspended=True reasons=[] n=0 p5=0.0 mean=0.0 hit=0.00 valid_rate=0.00 invalid_rows=0 class_counts={}"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
     churn_top_reasons_line = "none"
     churn_last_events_line = "none"
@@ -413,13 +416,19 @@ def hourly_summary() -> str:
             f" fill={float(g1.get('fill_rate', 0.0) or 0.0):.2f} expired={float(g1.get('expired_rate', 0.0) or 0.0):.2f} cond_fill_pnl={float(g1.get('pnl_conditional_on_fill', 0.0) or 0.0):.1f}"
             f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
         )
-        dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f}"
+        dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} fills_24h={int(rs.get('execution_churn_count',0) or 0)} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f} limit=80"
+        openpos_line = f"OpenPositions basis={sj.get('open_positions_basis','shadow_ledger')} open={int(sj.get('open_positions',0) or 0)} max={int(sj.get('max_positions',0) or 0)} remaining_slots={int(sj.get('remaining_slots',0) or 0)}"
+        capacity_line = f"Capacity admitted={int(sj.get('capacity_admitted',0) or 0)} capacity_rejected={int(sj.get('capacity_rejected',0) or 0)}"
+        shadow_exec_line = f"shadow_attempts={int(sj.get('shadow_attempts',0) or 0)} shadow_fills={int(sj.get('shadow_fills',0) or 0)} shadow_expired={int(sj.get('shadow_expired',0) or 0)}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
+        class_counts = gm.get('class_counts', {}) if isinstance(gm, dict) else {}
+        invalid_rows = max(0, int((gm.get('n', 0) or 0)) - int((gm.get('n', 0) or 0) * float(gm.get('valid_rate', 0.0) or 0.0)))
         governor_line = (
             f"mode={gov.get('mode','recommend_only')} suspended={bool(gov.get('suspended', True))} "
             f"reasons={gov.get('suspend_reasons', [])} n={int(gm.get('n', 0) or 0)} "
-            f"mean={float(gm.get('mean', 0.0) or 0.0):.1f} p5={float(gm.get('p5', 0.0) or 0.0):.1f}"
+            f"p5={float(gm.get('p5', 0.0) or 0.0):.1f} mean={float(gm.get('mean', 0.0) or 0.0):.1f} hit={float(gm.get('hit_rate', 0.0) or 0.0):.2f} "
+            f"valid_rate={float(gm.get('valid_rate', 0.0) or 0.0):.2f} invalid_rows={invalid_rows} class_counts={class_counts}"
         )
         rd = rs.get('details', {}) or {}
         risk_eval_n = int(funnel['risk_evaluated_total'] or 0)
@@ -478,6 +487,9 @@ def hourly_summary() -> str:
         f"BloodbathRejectBreakdown: {bloodbath_reject_line}\n"
         f"BloodbathGhost: {bloodbath_ghost_line}\n"
         f"DDState: {dd_line}\n"
+        f"{openpos_line}\n"
+        f"{capacity_line}\n"
+        f"{shadow_exec_line}\n"
         f"ParameterGovernor: {governor_line}\n"
         f"ChurnDiagnostics: {churn_diag_line}\n"
         f"ChurnTopReasons: {churn_top_reasons_line}\n"
