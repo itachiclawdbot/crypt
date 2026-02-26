@@ -211,3 +211,7 @@ Phase-1B design docs:
 - Added cycle-level short-circuit semantics and evaluated-mode markers to prevent stage-logic contradictions.
 - Capacity admission proof now exported as deterministic admitted-top list.
 - Execution timing sanity (`min_fill_delay_cycles`) promoted to top-level hourly visibility.
+
+### 2026-02-27 Cooldown control-plane ordering patch
+- Added pre-ingest cooldown gate in cycle orchestrator to prevent unnecessary feed pulls/scoring while in cooldown.
+- Telemetry now distinguishes skipped/partial/full stage evaluation mode with explicit short-circuit reason.

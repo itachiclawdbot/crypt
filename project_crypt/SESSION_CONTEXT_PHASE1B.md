@@ -828,3 +828,28 @@ Operational rule:
 
 5) Git traceability
 - Pending commit for 6-change telemetry/state wave.
+
+---
+
+## 2026-02-27 cooldown-skip + counter purity patch (critical directive)
+1) Decision changes
+- Added top-loop cooldown short-circuit path in `run_cycle`: when halted reason is COOLDOWN and remaining>0, expensive ingest/scoring is skipped and compact status summary is emitted.
+- Unified shadow counters display to canonical event window in notifier (`ATTEMPT_STARTED`, `FILLED_MAKER`, `EXPIRED_UNFILLED`).
+- Shadow timing now prints NA when no fills.
+
+2) State machine / telemetry changes
+- Added explicit `short_circuit_reason` + `stages_evaluated_mode` propagation in summary + digest.
+- Added `CountersWindow` line and closed-trade streak basis line with timestamp.
+- Added DD diagnostics fields in sanity payload: `equity_current`, `equity_hwm_24h`, `realized_pnl_bps_24h`, `unrealized_pnl_bps`, `dd_formula_bps`.
+
+3) Capacity proof and consistency
+- Deterministic post-routing capacity admission with proof line `CapacityAdmittedTop`.
+- Overflow remains `RISK_CAPACITY_FULL`; true full-book remains `RISK_MAX_POSITIONS`.
+
+4) Validation
+- Compile checks passed.
+- Services restarted.
+- Forced Telegram digest confirms top ShadowExecTiming + short-circuit/counter/streak lines.
+
+5) Git traceability
+- Pending commit for cooldown-skip/counter-purity wave.

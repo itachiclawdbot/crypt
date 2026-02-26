@@ -1508,13 +1508,17 @@ def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL")
     # Consecutive losses from CLOSED trades only (pure streak)
     consec_losses = 0
     last_close_ts = None
+    scanned = 0
     for pnl, ts in closed_rows_24h:
-        if last_close_ts is None:
-            last_close_ts = ts
+        scanned += 1
         if pnl <= 0:
             consec_losses += 1
+            if last_close_ts is None:
+                last_close_ts = ts
         else:
             break
+    if last_close_ts is None and consec_losses > 0:
+        consec_losses = 0
     loss_pressure = float(sum(1 for x, _ in closed_rows_24h if x < 0))
 
     halt_reason = None
@@ -1593,6 +1597,8 @@ def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL")
             "churn_telemetry_suspect": bool(execution_churn > max(1, attempt_churn * 2)),
             "consecutive_losses_basis": "CLOSED_TRADES",
             "last_close_ts": last_close_ts,
+            "closed_trades_scanned": scanned,
+            "basis_error": bool(last_close_ts is None and consec_losses > 0),
         },
     }
 
@@ -2154,6 +2160,59 @@ def run_cycle() -> dict:
     CYCLE_SEQ += 1
     cycle_id = CYCLE_SEQ
     drained_exec = _drain_execution_results_and_apply()
+
+    # P0: top-loop cooldown short-circuit (skip expensive ingest/scoring)
+    rs_pre = load_risk_state()
+    if bool(rs_pre.get("halted")) and str(rs_pre.get("halt_reason") or "") == "COOLDOWN" and int(rs_pre.get("cooldown_seconds_remaining", 0) or 0) > 0:
+        with db() as c:
+            cur = c.cursor()
+            cur.execute("select source_name,status,count(*) c from source_health_log where ts >= datetime('now','-1 hour') group by source_name,status order by source_name")
+            health_rows = [{"source": str(r[0]), "status": str(r[1]), "count": int(r[2] or 0)} for r in cur.fetchall()]
+
+        summary = {
+            "discovered_total": 0,
+            "watch_total": 0,
+            "eligible_state_total": 0,
+            "actionable_state_total": 0,
+            "mapped_to_venue_total": 0,
+            "eligible_total": 0,
+            "alpha_pass_total": 0,
+            "risk_pass_total": 0,
+            "cost_pass_total": 0,
+            "proposed_total": 0,
+            "top_reject_reasons": {},
+            "sources_present": {},
+            "rejects_tradable": {},
+            "rejects_external": {},
+            "alpha_scored_total": 0,
+            "cost_evaluated_total": 0,
+            "risk_evaluated_total": 0,
+            "stage_reach": {"scored": None, "costed": None, "cost_pass": None, "risked": None, "sized": None, "actionable": 0},
+            "short_circuit_reason": "COOLDOWN_ACTIVE",
+            "stages_evaluated_mode": "SKIPPED",
+            "risk_state": rs_pre,
+            "macro_shock": {"macro_shock": False},
+            "bloodbath_lane": {"active": False, "reason": "GLOBAL_RISK_HALTED", "activation_reasons": []},
+            "parameter_governor": {"mode": "recommend_only", "suspended": True, "suspend_reasons": ["RISK_HALT"]},
+            "open_positions_basis": "shadow_state",
+            "open_positions": _shadow_open_positions_count(),
+            "max_positions": 0,
+            "remaining_slots": 0,
+            "capacity_admitted": 0,
+            "capacity_rejected": 0,
+            "shadow_attempts": int(drained_exec.get("attempts", 0) or 0),
+            "shadow_fills": int(drained_exec.get("fills", 0) or 0),
+            "shadow_expired": int(drained_exec.get("expired", 0) or 0),
+            "avg_fill_latency_sec": 0.0,
+            "min_fill_delay_cycles": None,
+            "dd_basis": "shadow_ledger",
+            "dd_hourly_bps": 0.0,
+            "dd_daily_bps": 0.0,
+            "source_health_ping": health_rows,
+            "fetched_signals": 0,
+        }
+        write_status({"state": "idle", "job": "cooldown_skip", "last_cycle_summary": summary})
+        return summary
 
     write_status({"state": "running", "job": "ingest_cryptocom"})
     crypto_bases, base_to_instrument = ingest_cryptocom()
@@ -2765,6 +2824,18 @@ def run_cycle() -> dict:
         dd_hourly = float((_cur.fetchone() or [0])[0] or 0.0)
         _cur.execute("select coalesce(sum(realized_pnl_bps),0) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours')")
         dd_daily = float((_cur.fetchone() or [0])[0] or 0.0)
+        _cur.execute("select ts, realized_pnl_bps from shadow_portfolio_ledger where ts >= datetime('now','-24 hours') order by ts asc")
+        eq_rows = _cur.fetchall()
+    eq = 10000.0
+    hwm = eq
+    for _, pnl in eq_rows:
+        eq += float(pnl or 0.0)
+        hwm = max(hwm, eq)
+    equity_current = eq
+    equity_hwm_24h = hwm
+    realized_24h = float(sum(float(r[1] or 0.0) for r in eq_rows)) if eq_rows else 0.0
+    unrealized = 0.0
+    dd_formula_bps = ((equity_hwm_24h - equity_current) / max(1e-9, equity_hwm_24h)) * 10000.0
     sanity = {
         "micro_target_k": micro_target_k,
         "pre_cost_skip_breakdown": dict(pre_cost_skip),
@@ -2798,6 +2869,11 @@ def run_cycle() -> dict:
         "dd_basis": "shadow_ledger",
         "dd_hourly_bps": round(dd_hourly, 2),
         "dd_daily_bps": round(dd_daily, 2),
+        "equity_current": round(equity_current, 2),
+        "equity_hwm_24h": round(equity_hwm_24h, 2),
+        "realized_pnl_bps_24h": round(realized_24h, 2),
+        "unrealized_pnl_bps": round(unrealized, 2),
+        "dd_formula_bps": round(dd_formula_bps, 2),
         "risk_state": risk_state,
         "macro_shock": macro,
         "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),

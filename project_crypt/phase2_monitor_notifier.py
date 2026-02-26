@@ -270,6 +270,8 @@ def hourly_summary() -> str:
         exec_60m = int((cur.fetchone() or [0])[0] or 0)
         cur.execute("select count(*) from churn_event_log where ts>=datetime('now','-5 minutes') and event_class='EXECUTION' and counted=1")
         exec_5m = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("select count(*) from churn_event_log where ts>=? and event_reason='EXPIRED_UNFILLED'", (since,))
+        expired_60m = int((cur.fetchone() or [0])[0] or 0)
         cur.execute("select event_reason,count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by event_reason order by c desc limit 3", (since,))
         top_attempt_reasons = cur.fetchall()
         cur.execute("select ts,event_class,symbol,event_reason,coalesce(lane,'-') lane from churn_event_log order by id desc limit 10")
@@ -361,7 +363,8 @@ def hourly_summary() -> str:
     dd_line = "dd_basis=shadow_ledger fills_24h=0 dd_1h=0.0 dd_24h=0.0 limit=80"
     openpos_line = "OpenPositions basis=shadow_ledger open=0 max=0 remaining_slots=0"
     capacity_line = "Capacity admitted=0 capacity_rejected=0"
-    shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0"
+    shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0 avg_fill_latency_sec=NA min_fill_delay_cycles=NA"
+    shadow_timing_line = "ShadowExecTiming: fills_count=0 min_fill_delay_cycles=NA avg_fill_latency_sec=NA"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0 p5=0.0 mean=0.0 hit=0.00 valid_rate=0.00 invalid_rows=0 class_counts={}"
     capacity_admitted_top_line = "CapacityAdmittedTop=[]"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
@@ -426,7 +429,17 @@ def hourly_summary() -> str:
         dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} fills_24h={int(rs.get('execution_churn_count',0) or 0)} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f} limit=80"
         openpos_line = f"OpenPositions basis={sj.get('open_positions_basis','shadow_ledger')} open={int(sj.get('open_positions',0) or 0)} max={int(sj.get('max_positions',0) or 0)} remaining_slots={int(sj.get('remaining_slots',0) or 0)}"
         capacity_line = f"Capacity admitted={int(sj.get('capacity_admitted',0) or 0)} capacity_rejected={int(sj.get('capacity_rejected',0) or 0)}"
-        shadow_exec_line = f"shadow_attempts={int(sj.get('shadow_attempts',0) or 0)} shadow_fills={int(sj.get('shadow_fills',0) or 0)} shadow_expired={int(sj.get('shadow_expired',0) or 0)} avg_fill_latency_sec={float(sj.get('avg_fill_latency_sec',0.0) or 0.0):.3f} min_fill_delay_cycles={int(sj.get('min_fill_delay_cycles',1) or 1)}"
+        fills_count = int(exec_60m)
+        min_delay = sj.get('min_fill_delay_cycles', None)
+        avg_latency = sj.get('avg_fill_latency_sec', None)
+        if fills_count <= 0:
+            min_delay_txt = 'NA'
+            avg_latency_txt = 'NA'
+        else:
+            min_delay_txt = str(int(min_delay or 1))
+            avg_latency_txt = f"{float(avg_latency or 0.0):.3f}"
+        shadow_exec_line = f"shadow_attempts={attempt_60m} shadow_fills={exec_60m} shadow_expired={expired_60m} avg_fill_latency_sec={avg_latency_txt} min_fill_delay_cycles={min_delay_txt}"
+        shadow_timing_line = f"ShadowExecTiming: fills_count={fills_count} min_fill_delay_cycles={min_delay_txt} avg_fill_latency_sec={avg_latency_txt}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         class_counts = gm.get('class_counts', {}) if isinstance(gm, dict) else {}
@@ -474,7 +487,7 @@ def hourly_summary() -> str:
 
     return (
         "[Project Crypt][Phase-2][Hourly]\n"
-        f"ShadowExecTiming: fills_count={int((shadow_exec_line.split('shadow_fills=')[1].split()[0]) if 'shadow_fills=' in shadow_exec_line else 0)} min_fill_delay_cycles={int((shadow_exec_line.split('min_fill_delay_cycles=')[1]) if 'min_fill_delay_cycles=' in shadow_exec_line else 1)} avg_fill_latency_sec={float((shadow_exec_line.split('avg_fill_latency_sec=')[1].split()[0]) if 'avg_fill_latency_sec=' in shadow_exec_line else 0.0):.3f}\n"
+        f"{shadow_timing_line}\n"
         f"Window: last 1h\n"
         f"Fetched signals: {fetched}\n"
         f"By source: {src_txt}\n"
