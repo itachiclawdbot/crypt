@@ -1479,8 +1479,8 @@ def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL")
         cur.execute("select count(*) from churn_event_log where ts>=? and event_class='EXECUTION' and counted=1", (since_5m,))
         execution_churn_5m = int((cur.fetchone() or [0])[0] or 0)
 
-        cur.execute("select net_pnl_bps from ghost_sim_runs where ts>=? order by id desc limit 60", (since_24h,))
-        last_runs_24h = [float(r[0] or 0.0) for r in cur.fetchall()]
+        cur.execute("select realized_pnl_bps, ts from shadow_portfolio_ledger where ts>=? order by id desc limit 200", (since_24h,))
+        closed_rows_24h = [(float(r[0] or 0.0), str(r[1] or "")) for r in cur.fetchall()]
 
         cur.execute("select symbol, count(*) c from churn_event_log where ts>=? and event_class='ATTEMPT' and counted=1 group by symbol having c>=?", (since_5m, CHURN_SYMBOL_FAIL_LIMIT_5M))
         penalty_candidates = [str(r[0]) for r in cur.fetchall() if r[0]]
@@ -1505,14 +1505,17 @@ def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL")
             for r in cur.fetchall()
         ]
 
-    # Consecutive losses from latest execution-like outcomes
+    # Consecutive losses from CLOSED trades only (pure streak)
     consec_losses = 0
-    for pnl in last_runs_24h[:30]:
-        if pnl < 0:
+    last_close_ts = None
+    for pnl, ts in closed_rows_24h:
+        if last_close_ts is None:
+            last_close_ts = ts
+        if pnl <= 0:
             consec_losses += 1
         else:
             break
-    loss_pressure = float(sum(1 for x in last_runs_24h if x < 0))
+    loss_pressure = float(sum(1 for x, _ in closed_rows_24h if x < 0))
 
     halt_reason = None
     halted = False
@@ -1588,6 +1591,8 @@ def compute_shadow_risk_state(macro_shock: bool = False, regime: str = "NORMAL")
             "attempt_reasons_60m": attempt_reasons_60m,
             "last_attempt_events": last_attempt_events,
             "churn_telemetry_suspect": bool(execution_churn > max(1, attempt_churn * 2)),
+            "consecutive_losses_basis": "CLOSED_TRADES",
+            "last_close_ts": last_close_ts,
         },
     }
 
@@ -2192,7 +2197,7 @@ def run_cycle() -> dict:
     risk_pass_count = 0
     cost_pass_count = 0
     proposed_count = 0
-    shadow_attempts = 0
+    shadow_attempts = int(drained_exec.get("attempts", 0) or 0)
     shadow_fills = int(drained_exec.get("fills", 0) or 0)
     shadow_expired = int(drained_exec.get("expired", 0) or 0)
     reject_counter: Counter = Counter()
@@ -2445,10 +2450,6 @@ def run_cycle() -> dict:
             if open_positions >= max_positions:
                 early_risk_block = "RISK_MAX_POSITIONS"
                 log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "open_positions": open_positions, "regime": regime, "check_phase": "early"})
-            elif capacity_admitted >= remaining_slots:
-                early_risk_block = "RISK_CAPACITY_FULL"
-                capacity_rejected += 1
-                log_reject(sym, "risk", early_risk_block, {"max_positions": max_positions, "open_positions": open_positions, "remaining_slots": remaining_slots, "check_phase": "early"})
             elif current_same_symbol >= max_symbol_concentration:
                 early_risk_block = "RISK_CONCENTRATION"
                 log_reject(sym, "risk", early_risk_block, {"symbol": sym, "max_symbol_concentration": max_symbol_concentration, "check_phase": "early"})
@@ -2578,7 +2579,6 @@ def run_cycle() -> dict:
                     else:
                         risk_pass_count += 1
                         proposed_count += 1
-                        capacity_admitted += 1
                         stage_reached = "actionable"
                         status = "ACTIONABLE"
                         notional_util_samples.append(target_notional_adj / max(1.0, TARGET_NOTIONAL_USDT))
@@ -2596,7 +2596,6 @@ def run_cycle() -> dict:
                         # enqueue ACTIONABLE intent; worker will create ATTEMPT now and evaluate fill next cycle+
                         attempt_id = f"CORE-{sym}-{int(time.time()*1000)}-{random.randint(100,999)}"
                         crosses_spread = bool(chosen_style != "maker-first")
-                        shadow_attempts += 1
                         EXECUTION_INTENT_QUEUE.put({
                             "attempt_id": attempt_id,
                             "symbol": sym,
@@ -2626,6 +2625,8 @@ def run_cycle() -> dict:
             "size_reduced": size_reduced,
             "target_notional_adj": round(target_notional_adj, 2),
             "risk_flags": risk_flags,
+            "liquidity_cover": round(liquidity_cover, 3),
+            "spread_bps": round(spread_bps, 2),
             "mapped": mapped,
             "deny_stage": deny_stage,
             "deny_reason": deny_reason,
@@ -2693,12 +2694,52 @@ def run_cycle() -> dict:
     eligible_rows = [x for x in all_rows if x["status"] == "ELIGIBLE"]
     actionable_rows = [x for x in all_rows if x["status"] == "ACTIONABLE"]
 
+    # deterministic capacity routing at batch end
+    actionable_rows = sorted(
+        actionable_rows,
+        key=lambda x: (
+            -float(x.get("alpha_score", 0.0) or 0.0),
+            -float(x.get("cost_edge_bps", 0.0) or 0.0),
+            -float(x.get("liquidity_cover", 0.0) or 0.0),
+            float(x.get("spread_bps", 9999.0) or 9999.0),
+            str(x.get("symbol", "")),
+        ),
+    )
+    admitted_symbols = set(x["symbol"] for x in actionable_rows[:remaining_slots]) if remaining_slots > 0 else set()
+    capacity_admitted = len(admitted_symbols)
+    capacity_rejected = max(0, len(actionable_rows) - capacity_admitted)
+    if capacity_rejected > 0:
+        for r in all_rows:
+            if r.get("status") == "ACTIONABLE" and r.get("symbol") not in admitted_symbols:
+                r["status"] = "WATCH"
+                r["deny_stage"] = "risk"
+                r["deny_reason"] = "RISK_CAPACITY_FULL"
+                reject_counter["RISK_CAPACITY_FULL"] += 1
+                rejects_tradable["risk"] += 1
+                risk_code_counter["RISK_CAPACITY_FULL"] += 1
+
+        watch_rows = [x for x in all_rows if x["status"] in {"WATCH", "BLOCKED_BY_RISK"}]
+        eligible_rows = [x for x in all_rows if x["status"] == "ELIGIBLE"]
+        actionable_rows = [x for x in all_rows if x["status"] == "ACTIONABLE"]
+
     # watchlist must come from ELIGIBLE universe first
     watch_top = sorted(eligible_rows, key=lambda x: x["alpha_score"], reverse=True)[:10]
     if not watch_top and len(eligible_rows) > 0:
         watch_top = eligible_rows[:10]
     eligible_top = sorted(eligible_rows + actionable_rows, key=lambda x: x["alpha_score"], reverse=True)[:10]
     actionable_top = sorted(actionable_rows, key=lambda x: x["alpha_score"], reverse=True)[:5]
+
+    short_circuit_reason = "NONE"
+    stages_evaluated_mode = "FULL"
+    if risk_state.get("halted"):
+        short_circuit_reason = "GLOBAL_RISK_HALTED"
+        stages_evaluated_mode = "PARTIAL"
+    elif remaining_slots <= 0:
+        short_circuit_reason = "CAPACITY_FULL"
+        stages_evaluated_mode = "SKIPPED"
+    elif len(discovered) == 0:
+        short_circuit_reason = "NO_CANDIDATES"
+        stages_evaluated_mode = "SKIPPED"
 
     eligible_syms = {x["symbol"] for x in eligible_rows + actionable_rows}
     micro_join = len([s for s in eligible_syms if s in micro_latest])
@@ -2760,6 +2801,8 @@ def run_cycle() -> dict:
         "risk_state": risk_state,
         "macro_shock": macro,
         "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),
+        "short_circuit_reason": short_circuit_reason,
+        "stages_evaluated_mode": stages_evaluated_mode,
         "bloodbath_lane": bloodbath,
         "parameter_governor": governor,
     }
@@ -2821,6 +2864,8 @@ def run_cycle() -> dict:
             "sized": risk_pass_count,
             "actionable": len(actionable_rows),
         },
+        "short_circuit_reason": short_circuit_reason,
+        "stages_evaluated_mode": stages_evaluated_mode,
         "alpha_floor_effective": 50 if alpha_floor_override_count > 0 else MIN_ACTIONABLE_SCORE,
         "alpha_floor_overrides": alpha_floor_override_count,
         "pre_cost_skip_breakdown": dict(pre_cost_skip),

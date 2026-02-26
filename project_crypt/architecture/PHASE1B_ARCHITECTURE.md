@@ -206,3 +206,8 @@ Phase-1B design docs:
   - `execution_results_queue` (worker -> main)
 - Worker owns pending-attempt evaluation only; main loop is single writer for shadow ledger + SQLite persistence.
 - Fill physics now cycle-separated (`fill_cycle_id > attempt_cycle_id`) to avoid same-cycle fill artifacts.
+
+### 2026-02-27 Telemetry/state coherence update
+- Added cycle-level short-circuit semantics and evaluated-mode markers to prevent stage-logic contradictions.
+- Capacity admission proof now exported as deterministic admitted-top list.
+- Execution timing sanity (`min_fill_delay_cycles`) promoted to top-level hourly visibility.

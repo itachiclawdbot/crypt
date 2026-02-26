@@ -798,3 +798,33 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for message-passing/live-shadow-physics wave.
+
+---
+
+## 2026-02-27 telemetry purity + state machine enforcement (6-change wave)
+1) Decision summary
+- Added explicit short-circuit semantics (`short_circuit_reason`, `stages_evaluated_mode`) to avoid contradictory stage interpretation.
+- Enforced deterministic capacity post-routing with proof line `CapacityAdmittedTop`.
+- Made consecutive-loss telemetry explicitly closed-trade based in digest.
+- Moved `ShadowExecTiming` to digest top and added counters window line.
+
+2) Routing/flow impact
+- Capacity overflow now resolved after deterministic sort (alpha desc + tie-breakers), overflow labeled `RISK_CAPACITY_FULL`.
+- Main loop keeps queue-based execution model; counters are aligned to canonical event windows.
+
+3) Telemetry impact
+- Added/updated hourly lines:
+  - `ShadowExecTiming` at top (fills_count, min_fill_delay_cycles, avg_fill_latency)
+  - `short_circuit_reason` + `stages_evaluated_mode`
+  - `CountersWindow`
+  - `ConsecutiveLossesBasis=CLOSED_TRADES`
+  - `CapacityAdmittedTop`
+- micro pinned/interest counters now suppressed when unknown/zero to avoid misleading zeros.
+
+4) Validation
+- Compile checks passed.
+- Services restarted and running.
+- Forced Telegram digest sent and validated with new top timing line.
+
+5) Git traceability
+- Pending commit for 6-change telemetry/state wave.

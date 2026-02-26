@@ -302,6 +302,7 @@ def hourly_summary() -> str:
     watch_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f}:{r['deny_reason'] or 'ok'})" for r in watch_top) or "none"
     eligible_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in eligible) or "none"
     actionable_txt = ", ".join(f"{r['symbol']}({r['alpha_score']:.1f})" for r in actionable) or "none"
+    capacity_admitted_top_line = "CapacityAdmittedTop=[" + ", ".join(f"({r['symbol']},{float(r['alpha_score']):.1f})" for r in actionable[:5]) + "]" if actionable else "CapacityAdmittedTop=[]"
     reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in rejects) or "none"
     pressure_txt = ", ".join(f"{r['base_symbol']}[obi={r['obi_20bps']:.2f},liq={r['liquidity_score']:.1f}]" for r in pressure) or "none"
     event_reject_txt = ", ".join(f"{r['reason']}:{r['c']}" for r in event_rejects) or "none"
@@ -362,7 +363,11 @@ def hourly_summary() -> str:
     capacity_line = "Capacity admitted=0 capacity_rejected=0"
     shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0 p5=0.0 mean=0.0 hit=0.00 valid_rate=0.00 invalid_rows=0 class_counts={}"
+    capacity_admitted_top_line = "CapacityAdmittedTop=[]"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
+    short_circuit_line = "short_circuit_reason=NONE stages_evaluated_mode=FULL"
+    counters_window_line = "CountersWindow: from=now-60m to=now"
+    consec_line = "ConsecutiveLossesBasis=CLOSED_TRADES streak=0 last_close_ts=-"
     churn_top_reasons_line = "none"
     churn_last_events_line = "none"
     penalty_symbols_line = "none"
@@ -380,18 +385,20 @@ def hourly_summary() -> str:
             sj = json.loads(funnel['sanity_json'] or '{}')
         except Exception:
             sj = {}
+        pin = int(sj.get('micro_pinned_total', 0) or 0)
+        intr = int(sj.get('micro_interest_total', 0) or 0)
         micro_cov_line = (
             f"micro_target_K={sj.get('micro_target_k', 0)} "
             f"micro_tracked_total={sj.get('micro_tracked_total', sj.get('micro_present', 0))} "
-            f"micro_pinned_total={sj.get('micro_pinned_total', 0)} "
-            f"micro_interest_total={sj.get('micro_interest_total', 0)} "
-            f"eligible_unique={sj.get('eligible_unique', 0)} "
-            f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
-            f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
+            + (f"micro_pinned_total={pin} micro_interest_total={intr} " if (pin > 0 or intr > 0) else "")
+            + f"eligible_unique={sj.get('eligible_unique', 0)} "
+            + f"intersection_with_eligible={max(0, sj.get('eligible_unique', 0) - sj.get('micro_join_fail', 0))} "
+            + f"join_rate={((sj.get('join_rate_to_eligible', {}) or {}).get('micro', 0))}"
         )
         pre_cost_line = str(sj.get('pre_cost_skip_breakdown', {}))
         util_line = str(sj.get('avg_notional_utilization', 0))
         risk_codes_line = str(sj.get('risk_reason_codes', {}))
+        short_circuit_line = f"short_circuit_reason={sj.get('short_circuit_reason','NONE')} stages_evaluated_mode={sj.get('stages_evaluated_mode','FULL')}"
         rs = sj.get('risk_state', {}) or {}
         risk_state_line = (
             f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} prev={rs.get('previous_halt_reason') or '-'} "
@@ -431,6 +438,7 @@ def hourly_summary() -> str:
             f"valid_rate={float(gm.get('valid_rate', 0.0) or 0.0):.2f} invalid_rows={invalid_rows} class_counts={class_counts}"
         )
         rd = rs.get('details', {}) or {}
+        consec_line = f"ConsecutiveLossesBasis={rd.get('consecutive_losses_basis','CLOSED_TRADES')} streak={int(rs.get('consecutive_losses',0) or 0)} last_close_ts={rd.get('last_close_ts') or '-'}"
         risk_eval_n = int(funnel['risk_evaluated_total'] or 0)
         suspect = bool(exec_60m > max(5, risk_eval_n * 3) or (attempt_60m == 0 and risk_eval_n > 0 and exec_60m > 0))
         churn_diag_line = (
@@ -439,6 +447,7 @@ def hourly_summary() -> str:
             f"penalty_symbols={int(rd.get('unique_penalty_symbols', 0) or 0)} hot_loop={bool(rd.get('hot_loop', False))} "
             f"suspect={suspect}"
         )
+        counters_window_line = f"CountersWindow: from={since} to={now}"
         sources_present_txt = (funnel["sources_present_json"] or "{}")[:260]
 
         # hard-stop bottleneck override
@@ -448,7 +457,11 @@ def hourly_summary() -> str:
             periodic_reco = "Global risk halt dominates; fix RiskState/churn/loss machine before tuning alpha/cost thresholds."
 
     cliff_hint = "none"
-    if funnel and int(funnel['risk_evaluated_total'] or 0) == 0 and int(funnel['cost_pass_total'] or 0) == 0:
+    if short_circuit_line.startswith("short_circuit_reason=CAPACITY_FULL"):
+        cliff_hint = "Capacity short-circuit: downstream stages skipped (not a cost cliff)."
+    elif short_circuit_line.startswith("short_circuit_reason=GLOBAL_RISK_HALTED"):
+        cliff_hint = "Global risk halt short-circuit: downstream stages skipped."
+    elif funnel and int(funnel['risk_evaluated_total'] or 0) == 0 and int(funnel['cost_pass_total'] or 0) == 0:
         cliff_hint = "No candidates reached risk stage because cost_pass=0 (cost gate is current cliff)."
     elif funnel and int(funnel['risk_evaluated_total'] or 0) == 0:
         cliff_hint = "No candidates reached risk stage this window."
@@ -461,6 +474,7 @@ def hourly_summary() -> str:
 
     return (
         "[Project Crypt][Phase-2][Hourly]\n"
+        f"ShadowExecTiming: fills_count={int((shadow_exec_line.split('shadow_fills=')[1].split()[0]) if 'shadow_fills=' in shadow_exec_line else 0)} min_fill_delay_cycles={int((shadow_exec_line.split('min_fill_delay_cycles=')[1]) if 'min_fill_delay_cycles=' in shadow_exec_line else 1)} avg_fill_latency_sec={float((shadow_exec_line.split('avg_fill_latency_sec=')[1].split()[0]) if 'avg_fill_latency_sec=' in shadow_exec_line else 0.0):.3f}\n"
         f"Window: last 1h\n"
         f"Fetched signals: {fetched}\n"
         f"By source: {src_txt}\n"
@@ -471,6 +485,9 @@ def hourly_summary() -> str:
         f"Counts: {counts_line}\n"
         f"Evaluated: {eval_line}\n"
         f"Stages: {stages_line}\n"
+        f"{short_circuit_line}\n"
+        f"{counters_window_line}\n"
+        f"{consec_line}\n"
         f"CliffHint: {cliff_hint}\n"
         f"Rejects(tradable): {rejects_line}\n"
         f"Rejects(external): {external_line}\n"
@@ -489,6 +506,7 @@ def hourly_summary() -> str:
         f"DDState: {dd_line}\n"
         f"{openpos_line}\n"
         f"{capacity_line}\n"
+        f"{capacity_admitted_top_line}\n"
         f"{shadow_exec_line}\n"
         f"ParameterGovernor: {governor_line}\n"
         f"ChurnDiagnostics: {churn_diag_line}\n"
