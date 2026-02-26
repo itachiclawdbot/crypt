@@ -6,6 +6,9 @@ import os
 import random
 import sqlite3
 import time
+import queue
+from dataclasses import dataclass
+from pathlib import Path
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
@@ -16,6 +19,63 @@ from project_crypt.telegram_notify import TelegramNotifier
 DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3")
 POLL_SECONDS = int(os.getenv("PHASE2_POLL_SECONDS", "300"))
 STATUS_PATH = os.getenv("PHASE2_STATUS_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
+
+EXECUTION_INTENT_QUEUE: "queue.Queue[dict]" = queue.Queue()
+EXECUTION_RESULTS_QUEUE: "queue.Queue[dict]" = queue.Queue()
+CYCLE_SEQ = 0
+SHADOW_STATE = {"open_positions": {}, "fills_24h": [], "attempts": 0, "fills": 0, "expired": 0, "latencies_sec": [], "min_delay_cycles": None}
+
+@dataclass
+class ShadowAttempt:
+    attempt_id: str
+    symbol: str
+    lane: str
+    attempt_cycle_id: int
+    attempt_ts: float
+    maker_time_budget_sec: int
+    p_fill_hint: float
+    crosses_spread: bool
+
+
+class ShadowExecutionWorker:
+    def __init__(self):
+        self.pending: dict[str, ShadowAttempt] = {}
+
+    def process_intents(self, cycle_id: int):
+        while True:
+            try:
+                it = EXECUTION_INTENT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            a = ShadowAttempt(
+                attempt_id=it["attempt_id"], symbol=it["symbol"], lane=it.get("lane","CORE"),
+                attempt_cycle_id=cycle_id, attempt_ts=time.time(), maker_time_budget_sec=int(it.get("maker_time_budget_sec",45)),
+                p_fill_hint=float(it.get("p_fill_hint",0.4)), crosses_spread=bool(it.get("crosses_spread",False))
+            )
+            self.pending[a.attempt_id]=a
+            EXECUTION_RESULTS_QUEUE.put({"type":"ATTEMPT_STARTED","attempt_id":a.attempt_id,"symbol":a.symbol,"lane":a.lane,"attempt_cycle_id":a.attempt_cycle_id,"attempt_ts":a.attempt_ts})
+
+    def on_market_snapshot(self, cycle_id: int):
+        now=time.time()
+        done=[]
+        for aid,a in list(self.pending.items()):
+            if cycle_id <= a.attempt_cycle_id:
+                continue
+            if a.crosses_spread:
+                EXECUTION_RESULTS_QUEUE.put({"type":"ATTEMPT_FAILED","reason":"CROSSES_SPREAD","attempt_id":aid,"symbol":a.symbol,"lane":a.lane,"attempt_cycle_id":a.attempt_cycle_id,"fill_cycle_id":cycle_id,"attempt_ts":a.attempt_ts,"fill_ts":now})
+                done.append(aid); continue
+            if (now - a.attempt_ts) >= a.maker_time_budget_sec:
+                EXECUTION_RESULTS_QUEUE.put({"type":"EXPIRED_UNFILLED","attempt_id":aid,"symbol":a.symbol,"lane":a.lane,"attempt_cycle_id":a.attempt_cycle_id,"fill_cycle_id":cycle_id,"attempt_ts":a.attempt_ts,"fill_ts":now})
+                done.append(aid); continue
+            if random.random() < min(0.9,max(0.05,a.p_fill_hint*0.35)):
+                fill_id=f"SF-{a.symbol}-{aid}"
+                EXECUTION_RESULTS_QUEUE.put({"type":"FILLED_MAKER","attempt_id":aid,"execution_id":fill_id,"symbol":a.symbol,"lane":a.lane,"attempt_cycle_id":a.attempt_cycle_id,"fill_cycle_id":cycle_id,"attempt_ts":a.attempt_ts,"fill_ts":now})
+                done.append(aid)
+        for aid in done:
+            self.pending.pop(aid,None)
+
+SHADOW_WORKER = ShadowExecutionWorker()
+
 
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY")
@@ -2035,7 +2095,61 @@ def run_ghost_simulator(macro_shock: bool = False) -> dict:
     return {"rows": rows_done, "sampled": sampled, "by_reason": dict(by_reason), "macro_shock": bool(macro_shock)}
 
 
+
+
+def _drain_execution_results_and_apply() -> dict:
+    drained = {"attempts": 0, "fills": 0, "expired": 0, "latencies": [], "delay_cycles": []}
+    now = time.time()
+    # expire old open positions after 24h for slot realism
+    for sym, ots in list(SHADOW_STATE["open_positions"].items()):
+        if now - float(ots) > 24 * 3600:
+            SHADOW_STATE["open_positions"].pop(sym, None)
+
+    while True:
+        try:
+            ev = EXECUTION_RESULTS_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        et = ev.get("type")
+        aid = ev.get("attempt_id", "")
+        sym = ev.get("symbol", "")
+        lane = ev.get("lane", "CORE")
+        if et == "ATTEMPT_STARTED":
+            drained["attempts"] += 1
+            SHADOW_STATE["attempts"] += 1
+            log_churn_event(aid, sym, "ATTEMPT", "ATTEMPT_STARTED", True, {"attempt_cycle_id": ev.get("attempt_cycle_id")}, lane=lane)
+        elif et == "FILLED_MAKER":
+            drained["fills"] += 1
+            SHADOW_STATE["fills"] += 1
+            latency = max(0.0, float(ev.get("fill_ts", now)) - float(ev.get("attempt_ts", now)))
+            delay_cycles = int(ev.get("fill_cycle_id", 0) or 0) - int(ev.get("attempt_cycle_id", 0) or 0)
+            drained["latencies"].append(latency)
+            drained["delay_cycles"].append(delay_cycles)
+            SHADOW_STATE["latencies_sec"].append(latency)
+            SHADOW_STATE["min_delay_cycles"] = delay_cycles if SHADOW_STATE.get("min_delay_cycles") is None else min(SHADOW_STATE["min_delay_cycles"], delay_cycles)
+            SHADOW_STATE["open_positions"][sym] = float(ev.get("fill_ts", now))
+            execution_id = str(ev.get("execution_id") or f"E-{aid}")
+            log_churn_event(aid, sym, "EXECUTION", "FILLED_MAKER", True, {"delay_cycles": delay_cycles}, lane=lane, execution_id=execution_id)
+            with db() as c:
+                c.execute("insert or ignore into shadow_portfolio_ledger (ts,symbol,lane,fill_id,execution_style_intent,realized_pnl_bps,details_json) values (?,?,?,?,?,?,?)",
+                          (utc_now(), sym, lane, execution_id, "MAKER_POST_ONLY", 0.0, json.dumps({"attempt_id": aid}, default=str)))
+        elif et in {"EXPIRED_UNFILLED", "ATTEMPT_FAILED"}:
+            drained["expired"] += 1
+            SHADOW_STATE["expired"] += 1
+            reason = ev.get("reason") or et
+            log_churn_event(aid, sym, "ATTEMPT", str(reason), False, {"attempt_cycle_id": ev.get("attempt_cycle_id"), "fill_cycle_id": ev.get("fill_cycle_id")}, lane=lane)
+    return drained
+
+
+def _shadow_open_positions_count() -> int:
+    return len(SHADOW_STATE.get("open_positions", {}))
+
 def run_cycle() -> dict:
+    global CYCLE_SEQ
+    CYCLE_SEQ += 1
+    cycle_id = CYCLE_SEQ
+    drained_exec = _drain_execution_results_and_apply()
+
     write_status({"state": "running", "job": "ingest_cryptocom"})
     crypto_bases, base_to_instrument = ingest_cryptocom()
 
@@ -2063,6 +2177,8 @@ def run_cycle() -> dict:
 
     write_status({"state": "running", "job": "load_micro_features"})
     micro_latest = load_micro_latest()
+    # evaluate only pending attempts from previous cycles with fresh snapshot
+    SHADOW_WORKER.on_market_snapshot(cycle_id)
 
     sources_present = source_availability(cg, cmc, dex_latest, news_hits, venue_movers, llama_syms, dune_syms)
     discovered = sorted(set(cg).union(cmc).union(dex_latest).union(dex_boosted).union(venue_movers).union(new_listings).union(llama_syms).union(dune_syms))
@@ -2077,8 +2193,8 @@ def run_cycle() -> dict:
     cost_pass_count = 0
     proposed_count = 0
     shadow_attempts = 0
-    shadow_fills = 0
-    shadow_expired = 0
+    shadow_fills = int(drained_exec.get("fills", 0) or 0)
+    shadow_expired = int(drained_exec.get("expired", 0) or 0)
     reject_counter: Counter = Counter()
     rejects_tradable: Counter = Counter()
     rejects_external: Counter = Counter()
@@ -2098,10 +2214,7 @@ def run_cycle() -> dict:
     max_positions_normal = int(os.getenv("PHASE2_MAX_CONCURRENT_NORMAL", "10"))
     max_positions_volatile = int(os.getenv("PHASE2_MAX_CONCURRENT_VOLATILE", "3"))
     max_positions = max_positions_volatile if regime == "VOLATILE" else max_positions_normal
-    with db() as _pc:
-        _cur = _pc.cursor()
-        _cur.execute("select count(distinct symbol) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours')")
-        open_positions = int((_cur.fetchone() or [0])[0] or 0)
+    open_positions = _shadow_open_positions_count()
     remaining_slots = max(0, max_positions - open_positions)
     capacity_admitted = 0
     capacity_rejected = 0
@@ -2480,27 +2593,18 @@ def run_cycle() -> dict:
                             "new_listing": is_new_listing,
                         }, conviction="high")
 
-                        # enforce ACTIONABLE -> shadow execution attempt
+                        # enqueue ACTIONABLE intent; worker will create ATTEMPT now and evaluate fill next cycle+
                         attempt_id = f"CORE-{sym}-{int(time.time()*1000)}-{random.randint(100,999)}"
+                        crosses_spread = bool(chosen_style != "maker-first")
                         shadow_attempts += 1
-                        log_churn_event(attempt_id, sym, "ATTEMPT", "ATTEMPT_STARTED", True, {
+                        EXECUTION_INTENT_QUEUE.put({
+                            "attempt_id": attempt_id,
+                            "symbol": sym,
                             "lane": "CORE",
-                            "execution_style_intent": "MAKER_POST_ONLY" if chosen_style == "maker-first" else "TAKER",
                             "maker_time_budget_sec": maker_time_budget_sec,
-                        }, lane="CORE")
-                        filled = bool(chosen_style == "maker-first" and p_fill_maker >= 0.45)
-                        if filled:
-                            execution_id = f"CF-{sym}-{attempt_id}"
-                            shadow_fills += 1
-                            log_churn_event(attempt_id, sym, "EXECUTION", "FILLED_MAKER", True, {"net_pnl_bps": cost_edge_bps}, lane="CORE", execution_id=execution_id)
-                            with db() as _lc:
-                                _lc.execute(
-                                    "insert or ignore into shadow_portfolio_ledger (ts,symbol,lane,fill_id,execution_style_intent,realized_pnl_bps,details_json) values (?,?,?,?,?,?,?)",
-                                    (utc_now(), sym, "CORE", execution_id, "MAKER_POST_ONLY", float(cost_edge_bps), json.dumps({"attempt_id": attempt_id}, default=str)),
-                                )
-                        else:
-                            shadow_expired += 1
-                            log_churn_event(attempt_id, sym, "ATTEMPT", "EXPIRED_UNFILLED", False, {"lane": "CORE"}, lane="CORE")
+                            "p_fill_hint": p_fill_maker,
+                            "crosses_spread": crosses_spread,
+                        })
 
         if sym in {"USDT", "USDC", "USD", "EUR"}:
             invalid_assets_filtered += 1
@@ -2602,6 +2706,9 @@ def run_cycle() -> dict:
     llama_join = len([s for s in eligible_syms if s in llama_syms])
     dex_join = len([s for s in eligible_syms if s in dex_latest or s in dex_boosted])
     denom = max(1, len(eligible_syms))
+    # start attempts for intents queued this cycle (fills evaluated in future cycles only)
+    SHADOW_WORKER.process_intents(cycle_id)
+
     micro_target_k = int(os.getenv("MICRO_TOP_SYMBOLS", "150"))
     micro_pinned_total = 0
     micro_interest_total = 0
@@ -2636,7 +2743,7 @@ def run_cycle() -> dict:
         },
         "micro_join_fail": micro_join_fail,
         "risk_reason_codes": dict(risk_code_counter),
-        "open_positions_basis": "shadow_ledger",
+        "open_positions_basis": "shadow_state",
         "open_positions": open_positions,
         "max_positions": max_positions,
         "remaining_slots": remaining_slots,
@@ -2645,6 +2752,8 @@ def run_cycle() -> dict:
         "shadow_attempts": shadow_attempts,
         "shadow_fills": shadow_fills,
         "shadow_expired": shadow_expired,
+        "avg_fill_latency_sec": round((sum(drained_exec.get("latencies", []) or [0.0]) / max(1, len(drained_exec.get("latencies", [])))), 3) if drained_exec.get("latencies") else 0.0,
+        "min_fill_delay_cycles": int(min(drained_exec.get("delay_cycles", [1])) if drained_exec.get("delay_cycles") else (SHADOW_STATE.get("min_delay_cycles") or 1)),
         "dd_basis": "shadow_ledger",
         "dd_hourly_bps": round(dd_hourly, 2),
         "dd_daily_bps": round(dd_daily, 2),

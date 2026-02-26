@@ -405,9 +405,9 @@ def hourly_summary() -> str:
         bb = sj.get('bloodbath_lane', {}) or {}
         bloodbath_line = f"LaneActive={bool(bb.get('active', False))} reason={bb.get('reason', '-')} reasons={bb.get('activation_reasons', [])} attempts_hour={int(bb.get('attempts_hour', 0) or 0)} majors_eval={int(bb.get('majors_evaluated', 0) or 0)}"
         cands = bb.get('candidates_top', []) or []
-        bloodbath_candidates_line = ", ".join(
+        bloodbath_candidates_line = "thr_pc>=0.60 | " + (", ".join(
             f"{x.get('symbol')}[pc={x.get('pressure_confidence')},ss={x.get('spread_stability')},util={x.get('utilization')}]" for x in cands[:3]
-        ) or "none"
+        ) or "none")
         g1 = bb.get('ghost_1h', {}) or {}
         g24 = bb.get('ghost_24h', {}) or {}
         bloodbath_reject_line = str(bb.get('reject_breakdown', {}))
@@ -419,7 +419,7 @@ def hourly_summary() -> str:
         dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} fills_24h={int(rs.get('execution_churn_count',0) or 0)} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f} limit=80"
         openpos_line = f"OpenPositions basis={sj.get('open_positions_basis','shadow_ledger')} open={int(sj.get('open_positions',0) or 0)} max={int(sj.get('max_positions',0) or 0)} remaining_slots={int(sj.get('remaining_slots',0) or 0)}"
         capacity_line = f"Capacity admitted={int(sj.get('capacity_admitted',0) or 0)} capacity_rejected={int(sj.get('capacity_rejected',0) or 0)}"
-        shadow_exec_line = f"shadow_attempts={int(sj.get('shadow_attempts',0) or 0)} shadow_fills={int(sj.get('shadow_fills',0) or 0)} shadow_expired={int(sj.get('shadow_expired',0) or 0)}"
+        shadow_exec_line = f"shadow_attempts={int(sj.get('shadow_attempts',0) or 0)} shadow_fills={int(sj.get('shadow_fills',0) or 0)} shadow_expired={int(sj.get('shadow_expired',0) or 0)} avg_fill_latency_sec={float(sj.get('avg_fill_latency_sec',0.0) or 0.0):.3f} min_fill_delay_cycles={int(sj.get('min_fill_delay_cycles',1) or 1)}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         class_counts = gm.get('class_counts', {}) if isinstance(gm, dict) else {}

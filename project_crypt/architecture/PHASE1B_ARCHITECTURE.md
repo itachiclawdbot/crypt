@@ -199,3 +199,10 @@ Phase-1B design docs:
   - `RISK_MAX_POSITIONS` = ledger full
   - `RISK_CAPACITY_FULL` = batch overflow vs remaining slots
 - Actionable routing now includes mandatory shadow execution attempt path (core lane), producing ATTEMPT/EXECUTION telemetry and shadow ledger updates.
+
+### 2026-02-27 Execution orchestration update (queue-based shadow engine)
+- Introduced explicit main↔worker message passing queues:
+  - `execution_intent_queue` (main -> worker)
+  - `execution_results_queue` (worker -> main)
+- Worker owns pending-attempt evaluation only; main loop is single writer for shadow ledger + SQLite persistence.
+- Fill physics now cycle-separated (`fill_cycle_id > attempt_cycle_id`) to avoid same-cycle fill artifacts.

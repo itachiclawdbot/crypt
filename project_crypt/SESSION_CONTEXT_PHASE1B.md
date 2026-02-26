@@ -763,3 +763,38 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for capacity+shadow-exec wave.
+
+---
+
+## 2026-02-27 live shadow physics + message passing execution wave
+1) Decision change summary
+- Implemented queue-based execution architecture (`execution_intent_queue` / `execution_results_queue`) with single-writer main loop semantics for shadow state.
+- Enforced cycle-separated fill physics: attempts start in cycle T and are only evaluated from cycle T+1 onward.
+- Removed DB dependency from capacity hot-path by using in-memory `shadow_state` open positions.
+
+2) Routing/flow impact
+- Main loop now:
+  - drains results queue at cycle start and applies state,
+  - evaluates pending attempts on fresh market snapshot,
+  - enqueues new intents for current actionable candidates,
+  - starts attempts this cycle (fills deferred by physics).
+- Worker never mutates ledger DB; only main loop writes ledger/event persistence.
+
+3) Data/model impact
+- Added in-memory `ShadowExecutionWorker` + pending attempt map.
+- Added telemetry fields:
+  - `avg_fill_latency_sec`, `min_fill_delay_cycles`
+  - `shadow_attempts`, `shadow_fills`, `shadow_expired`
+  - `open_positions_basis=shadow_state` and capacity counters.
+
+4) Runtime/ops impact
+- Hourly lines now surface OpenPositions/Capacity/ShadowExec timing physics.
+- Bloodbath lane includes activation reasons + reject breakdown + thresholded candidate view.
+
+5) Validation
+- Compile checks passed.
+- Services restarted and running.
+- Forced Telegram digest succeeded.
+
+6) Git traceability
+- Pending commit for message-passing/live-shadow-physics wave.
