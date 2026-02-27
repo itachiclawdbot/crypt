@@ -215,3 +215,8 @@ Phase-1B design docs:
 ### 2026-02-27 Cooldown control-plane ordering patch
 - Added pre-ingest cooldown gate in cycle orchestrator to prevent unnecessary feed pulls/scoring while in cooldown.
 - Telemetry now distinguishes skipped/partial/full stage evaluation mode with explicit short-circuit reason.
+
+### 2026-02-27 Nervous-system hardening
+- Boot now fail-closes on invalid config and rehydrates runtime shadow state before cycle loop.
+- Status channel hardened with atomic writes + sequence/schema metadata.
+- Queue drain now bounded with explicit backpressure telemetry to preserve cycle cadence under load.

@@ -853,3 +853,32 @@ Operational rule:
 
 5) Git traceability
 - Pending commit for cooldown-skip/counter-purity wave.
+
+---
+
+## 2026-02-27 reliability nervous-system hardening (boot/state/transport/physics/backpressure)
+1) Boot + durability
+- Added fail-closed boot validation (`MAX_POSITIONS > 0`, DB path validity).
+- Added boot rehydration of in-memory `SHADOW_STATE` from `shadow_portfolio_ledger` with bounded retry and WAL/busy_timeout DB settings.
+
+2) Status transport hardening
+- `write_status` now uses atomic temp-file + rename.
+- Status payload now includes `schema_version`, `status_seq`, `generated_ts`.
+- Notifier added strict status parse helper with stale fallback (`STALE_STATUS` + metadata).
+
+3) Execution physics + queue protections
+- Kept queue-based intent/result architecture and added bounded queue sizes.
+- Added bounded result-drain limits (`MAX_RESULTS_PER_CYCLE`, `MAX_DRAIN_MS`) with queue depth/backpressure telemetry.
+
+4) Risk/tuner telemetry purity
+- cooldown top-loop short-circuit retained; status reports `COOLDOWN_ACTIVE` skip mode.
+- Canonical counters window + stricter display mapping retained.
+- Added DD diagnostics (`equity_current`, `hwm`, realized/unrealized, formula) for basis proof.
+
+5) Acceptance evidence
+- Compile checks passed.
+- Services restarted and running.
+- Forced Telegram send succeeded.
+
+6) Git traceability
+- Pending commit for nervous-system hardening wave.

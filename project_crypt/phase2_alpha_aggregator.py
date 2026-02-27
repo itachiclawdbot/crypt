@@ -19,9 +19,11 @@ from project_crypt.telegram_notify import TelegramNotifier
 DB_PATH = os.getenv("CRYPTO_DB_PATH", "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3")
 POLL_SECONDS = int(os.getenv("PHASE2_POLL_SECONDS", "300"))
 STATUS_PATH = os.getenv("PHASE2_STATUS_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
+STATUS_SCHEMA_VERSION = 2
+STATUS_SEQ = 0
 
-EXECUTION_INTENT_QUEUE: "queue.Queue[dict]" = queue.Queue()
-EXECUTION_RESULTS_QUEUE: "queue.Queue[dict]" = queue.Queue()
+EXECUTION_INTENT_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=2000)
+EXECUTION_RESULTS_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=4000)
 CYCLE_SEQ = 0
 SHADOW_STATE = {"open_positions": {}, "fills_24h": [], "attempts": 0, "fills": 0, "expired": 0, "latencies_sec": [], "min_delay_cycles": None}
 
@@ -146,15 +148,24 @@ def utc_now() -> str:
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
 def write_status(payload: dict) -> None:
+    global STATUS_SEQ
+    STATUS_SEQ += 1
     payload["ts"] = utc_now()
-    with open(STATUS_PATH, "w", encoding="utf-8") as f:
+    payload["schema_version"] = STATUS_SCHEMA_VERSION
+    payload["status_seq"] = STATUS_SEQ
+    payload["generated_ts"] = utc_now()
+    tmp = STATUS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+    os.replace(tmp, STATUS_PATH)
 
 
 def _norm_url(endpoint: str) -> str:
@@ -2109,7 +2120,10 @@ def run_ghost_simulator(macro_shock: bool = False) -> dict:
 
 
 def _drain_execution_results_and_apply() -> dict:
-    drained = {"attempts": 0, "fills": 0, "expired": 0, "latencies": [], "delay_cycles": []}
+    max_items = int(os.getenv("PHASE2_MAX_RESULTS_PER_CYCLE", "500"))
+    max_ms = int(os.getenv("PHASE2_MAX_DRAIN_MS", "80"))
+    started = time.time()
+    drained = {"attempts": 0, "fills": 0, "expired": 0, "latencies": [], "delay_cycles": [], "drained_items": 0, "drain_ms": 0.0, "backpressure": False, "results_q_depth": EXECUTION_RESULTS_QUEUE.qsize(), "intents_q_depth": EXECUTION_INTENT_QUEUE.qsize()}
     now = time.time()
     # expire old open positions after 24h for slot realism
     for sym, ots in list(SHADOW_STATE["open_positions"].items()):
@@ -2117,8 +2131,12 @@ def _drain_execution_results_and_apply() -> dict:
             SHADOW_STATE["open_positions"].pop(sym, None)
 
     while True:
+        if drained["drained_items"] >= max_items or ((time.time() - started) * 1000.0) >= max_ms:
+            drained["backpressure"] = not EXECUTION_RESULTS_QUEUE.empty()
+            break
         try:
             ev = EXECUTION_RESULTS_QUEUE.get_nowait()
+            drained["drained_items"] += 1
         except queue.Empty:
             break
         et = ev.get("type")
@@ -2149,6 +2167,9 @@ def _drain_execution_results_and_apply() -> dict:
             SHADOW_STATE["expired"] += 1
             reason = ev.get("reason") or et
             log_churn_event(aid, sym, "ATTEMPT", str(reason), False, {"attempt_cycle_id": ev.get("attempt_cycle_id"), "fill_cycle_id": ev.get("fill_cycle_id")}, lane=lane)
+    drained["drain_ms"] = round((time.time() - started) * 1000.0, 3)
+    drained["results_q_depth"] = EXECUTION_RESULTS_QUEUE.qsize()
+    drained["intents_q_depth"] = EXECUTION_INTENT_QUEUE.qsize()
     return drained
 
 
@@ -2866,6 +2887,10 @@ def run_cycle() -> dict:
         "shadow_expired": shadow_expired,
         "avg_fill_latency_sec": round((sum(drained_exec.get("latencies", []) or [0.0]) / max(1, len(drained_exec.get("latencies", [])))), 3) if drained_exec.get("latencies") else 0.0,
         "min_fill_delay_cycles": int(min(drained_exec.get("delay_cycles", [1])) if drained_exec.get("delay_cycles") else (SHADOW_STATE.get("min_delay_cycles") or 1)),
+        "queue_results_depth": int(drained_exec.get("results_q_depth", 0) or 0),
+        "queue_intents_depth": int(drained_exec.get("intents_q_depth", 0) or 0),
+        "queue_drain_ms": float(drained_exec.get("drain_ms", 0.0) or 0.0),
+        "queue_backpressure": bool(drained_exec.get("backpressure", False)),
         "dd_basis": "shadow_ledger",
         "dd_hourly_bps": round(dd_hourly, 2),
         "dd_daily_bps": round(dd_daily, 2),
@@ -2977,8 +3002,49 @@ def run_cycle() -> dict:
     return summary
 
 
+
+
+def validate_boot_config() -> tuple[bool, str]:
+    if not DB_PATH or not Path(DB_PATH).parent.exists():
+        return False, 'DB_PATH_INVALID'
+    maxn = int(os.getenv('PHASE2_MAX_CONCURRENT_NORMAL', '10') or 0)
+    maxv = int(os.getenv('PHASE2_MAX_CONCURRENT_VOLATILE', '3') or 0)
+    if maxn <= 0 or maxv <= 0:
+        return False, 'MAX_POSITIONS_INVALID'
+    return True, 'OK'
+
+
+def rehydrate_shadow_state() -> tuple[bool, str]:
+    tries = 3
+    for _ in range(tries):
+        try:
+            with db() as c:
+                cur = c.cursor()
+                cur.execute("select symbol, max(ts) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours') group by symbol")
+                rows = cur.fetchall()
+                SHADOW_STATE['open_positions'] = {str(r[0]): time.time() for r in rows if r[0]}
+            return True, 'OK'
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                time.sleep(0.2)
+                continue
+            return False, 'STATE_REHYDRATE_FAILED'
+        except Exception:
+            return False, 'STATE_REHYDRATE_FAILED'
+    return False, 'STATE_REHYDRATE_FAILED'
+
 def main() -> None:
     init_tables()
+    ok_cfg, cfg_reason = validate_boot_config()
+    if not ok_cfg:
+        write_status({"state": "fail_closed", "job": "boot_validate", "short_circuit_reason": "CONFIG_INVALID", "error": cfg_reason})
+        while True:
+            time.sleep(30)
+    ok_reh, reh_reason = rehydrate_shadow_state()
+    if not ok_reh:
+        write_status({"state": "fail_closed", "job": "rehydrate", "short_circuit_reason": "STATE_REHYDRATE_FAILED", "error": reh_reason})
+        while True:
+            time.sleep(30)
     tg = TelegramNotifier()
     kill_switch_alerted = False
     startup_ping_sent = False

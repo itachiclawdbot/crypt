@@ -12,8 +12,29 @@ from project_crypt.telegram_notify import TelegramNotifier
 DB_PATH = "/home/itachi/.openclaw/workspace/project_crypt/cryptobot.sqlite3"
 NOTIFIER_LOG = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_monitor_notifier.log")
 NOTIFIER_HEARTBEAT = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_notifier_heartbeat.json")
+STATUS_PATH = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
+_LAST_GOOD_STATUS: dict = {}
 DISPLAY_EXCLUDE_BASES = {x.strip().upper() for x in ("USDT,USDC,USD,EUR,PYUSD,TUSD,USDP,BUSD,DAI,FDUSD,USDE,USAT,USD1").split(",") if x.strip()}
 
+
+
+
+def read_status_strict() -> tuple[dict, bool, str]:
+    global _LAST_GOOD_STATUS
+    try:
+        raw = STATUS_PATH.read_text(encoding='utf-8')
+        obj = json.loads(raw)
+        if not isinstance(obj, dict) or 'schema_version' not in obj or 'status_seq' not in obj:
+            raise ValueError('status_schema_invalid')
+        _LAST_GOOD_STATUS = obj
+        return obj, False, ''
+    except Exception as e:
+        try:
+            st = STATUS_PATH.stat()
+            meta = f"hash={hash(STATUS_PATH.read_text(encoding='utf-8', errors='ignore'))} mtime={st.st_mtime} size={st.st_size} err={type(e).__name__}"
+        except Exception:
+            meta = f"err={type(e).__name__}"
+        return (_LAST_GOOD_STATUS or {}), True, meta
 
 def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)
@@ -92,6 +113,7 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: st
 
 def hourly_summary() -> str:
     now = datetime.now(timezone.utc)
+    status_obj, stale_status, stale_meta = read_status_strict()
     since = (now - timedelta(hours=1)).isoformat()
     since_6h = (now - timedelta(hours=6)).isoformat()
     with db() as c:
@@ -370,11 +392,34 @@ def hourly_summary() -> str:
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
     short_circuit_line = "short_circuit_reason=NONE stages_evaluated_mode=FULL"
     counters_window_line = "CountersWindow: from=now-60m to=now"
-    consec_line = "ConsecutiveLossesBasis=CLOSED_TRADES streak=0 last_close_ts=-"
+    consec_line = "ConsecutiveLossesBasis=CLOSED_TRADES streak=0 last_close_ts=- closed_trades_scanned=0"
+    stale_status_line = "STALE_STATUS=False"
     churn_top_reasons_line = "none"
     churn_last_events_line = "none"
     penalty_symbols_line = "none"
     sources_present_txt = "{}"
+
+    if not funnel and isinstance(status_obj.get('last_cycle_summary'), dict):
+        ls = status_obj.get('last_cycle_summary') or {}
+        funnel = {
+            "discovered_total": ls.get("discovered_total", 0),
+            "mapped_to_venue_total": ls.get("mapped_to_venue_total", 0),
+            "eligible_total": ls.get("eligible_total", 0),
+            "watch_total": ls.get("watch_total", 0),
+            "actionable_total": ls.get("actionable_state_total", 0),
+            "alpha_scored_total": ls.get("alpha_scored_total", 0),
+            "cost_evaluated_total": ls.get("cost_evaluated_total", 0),
+            "cost_pass_total": ls.get("cost_pass_total", 0),
+            "risk_evaluated_total": ls.get("risk_evaluated_total", 0),
+            "risk_pass_total": ls.get("risk_pass_total", 0),
+            "proposed_total": ls.get("proposed_total", 0),
+            "reasons_json": json.dumps(ls.get("top_reject_reasons", {})),
+            "sources_present_json": json.dumps(ls.get("sources_present", {})),
+            "sanity_json": json.dumps(ls),
+            "regime": (ls.get("macro_shock") or {}).get("regime", "NORMAL"),
+            "pressure_count": 0,
+            "ts": status_obj.get("ts", "-"),
+        }
 
     if funnel:
         counts_line = f"WATCH={funnel['watch_total'] or 0} ELIGIBLE={funnel['eligible_total'] or 0} ACTIONABLE={funnel['actionable_total'] or 0}"
@@ -402,6 +447,9 @@ def hourly_summary() -> str:
         util_line = str(sj.get('avg_notional_utilization', 0))
         risk_codes_line = str(sj.get('risk_reason_codes', {}))
         short_circuit_line = f"short_circuit_reason={sj.get('short_circuit_reason','NONE')} stages_evaluated_mode={sj.get('stages_evaluated_mode','FULL')}"
+        if sj.get('short_circuit_reason') == 'COOLDOWN_ACTIVE':
+            fetched = int(sj.get('fetched_signals', 0) or 0)
+        stale_status_line = f"STALE_STATUS={bool(stale_status)} {stale_meta}" if stale_status else "STALE_STATUS=False"
         rs = sj.get('risk_state', {}) or {}
         risk_state_line = (
             f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} prev={rs.get('previous_halt_reason') or '-'} "
@@ -426,7 +474,7 @@ def hourly_summary() -> str:
             f" fill={float(g1.get('fill_rate', 0.0) or 0.0):.2f} expired={float(g1.get('expired_rate', 0.0) or 0.0):.2f} cond_fill_pnl={float(g1.get('pnl_conditional_on_fill', 0.0) or 0.0):.1f}"
             f" | 24h:trades={int(g24.get('trades', 0) or 0)} net={float(g24.get('net_pnl_bps', 0.0) or 0.0):.1f} win={float(g24.get('winrate', 0.0) or 0.0):.2f}"
         )
-        dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} fills_24h={int(rs.get('execution_churn_count',0) or 0)} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f} limit=80"
+        dd_line = f"dd_basis={sj.get('dd_basis','shadow_ledger')} fills_24h={int(rs.get('execution_churn_count',0) or 0)} dd_1h={float(sj.get('dd_hourly_bps',0.0) or 0.0):.1f} dd_24h={float(sj.get('dd_daily_bps',0.0) or 0.0):.1f} eq={float(sj.get('equity_current',0.0) or 0.0):.2f} hwm={float(sj.get('equity_hwm_24h',0.0) or 0.0):.2f} r24h={float(sj.get('realized_pnl_bps_24h',0.0) or 0.0):.2f} u={float(sj.get('unrealized_pnl_bps',0.0) or 0.0):.2f} dd_formula={float(sj.get('dd_formula_bps',0.0) or 0.0):.2f} limit=80"
         openpos_line = f"OpenPositions basis={sj.get('open_positions_basis','shadow_ledger')} open={int(sj.get('open_positions',0) or 0)} max={int(sj.get('max_positions',0) or 0)} remaining_slots={int(sj.get('remaining_slots',0) or 0)}"
         capacity_line = f"Capacity admitted={int(sj.get('capacity_admitted',0) or 0)} capacity_rejected={int(sj.get('capacity_rejected',0) or 0)}"
         fills_count = int(exec_60m)
@@ -438,7 +486,7 @@ def hourly_summary() -> str:
         else:
             min_delay_txt = str(int(min_delay or 1))
             avg_latency_txt = f"{float(avg_latency or 0.0):.3f}"
-        shadow_exec_line = f"shadow_attempts={attempt_60m} shadow_fills={exec_60m} shadow_expired={expired_60m} avg_fill_latency_sec={avg_latency_txt} min_fill_delay_cycles={min_delay_txt}"
+        shadow_exec_line = f"shadow_attempts={attempt_60m} shadow_fills={exec_60m} shadow_expired={expired_60m} avg_fill_latency_sec={avg_latency_txt} min_fill_delay_cycles={min_delay_txt} q_intents={int(sj.get('queue_intents_depth',0) or 0)} q_results={int(sj.get('queue_results_depth',0) or 0)} drain_ms={float(sj.get('queue_drain_ms',0.0) or 0.0):.2f} backpressure={bool(sj.get('queue_backpressure',False))}"
         shadow_timing_line = f"ShadowExecTiming: fills_count={fills_count} min_fill_delay_cycles={min_delay_txt} avg_fill_latency_sec={avg_latency_txt}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
@@ -451,7 +499,7 @@ def hourly_summary() -> str:
             f"valid_rate={float(gm.get('valid_rate', 0.0) or 0.0):.2f} invalid_rows={invalid_rows} class_counts={class_counts}"
         )
         rd = rs.get('details', {}) or {}
-        consec_line = f"ConsecutiveLossesBasis={rd.get('consecutive_losses_basis','CLOSED_TRADES')} streak={int(rs.get('consecutive_losses',0) or 0)} last_close_ts={rd.get('last_close_ts') or '-'}"
+        consec_line = f"ConsecutiveLossesBasis={rd.get('consecutive_losses_basis','CLOSED_TRADES')} streak={int(rs.get('consecutive_losses',0) or 0)} last_close_ts={rd.get('last_close_ts') or '-'} closed_trades_scanned={int(rd.get('closed_trades_scanned',0) or 0)} basis_error={bool(rd.get('basis_error',False))}"
         risk_eval_n = int(funnel['risk_evaluated_total'] or 0)
         suspect = bool(exec_60m > max(5, risk_eval_n * 3) or (attempt_60m == 0 and risk_eval_n > 0 and exec_60m > 0))
         churn_diag_line = (
@@ -489,6 +537,7 @@ def hourly_summary() -> str:
         "[Project Crypt][Phase-2][Hourly]\n"
         f"{shadow_timing_line}\n"
         f"Window: last 1h\n"
+        f"{stale_status_line}\n"
         f"Fetched signals: {fetched}\n"
         f"By source: {src_txt}\n"
         f"Trend signals: {sig_txt}\n"
