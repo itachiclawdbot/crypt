@@ -220,3 +220,7 @@ Phase-1B design docs:
 - Boot now fail-closes on invalid config and rehydrates runtime shadow state before cycle loop.
 - Status channel hardened with atomic writes + sequence/schema metadata.
 - Queue drain now bounded with explicit backpressure telemetry to preserve cycle cadence under load.
+
+### 2026-02-27 status-channel health v2
+- Status parse health is now independent from DB-rendered digest content and always surfaced via `StatusSnapshot`.
+- Coherency gate suppresses control-plane render when latest snapshot is not `cycle_complete/full`.

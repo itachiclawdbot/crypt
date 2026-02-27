@@ -409,8 +409,14 @@ def hourly_summary() -> str:
     short_circuit_line = "short_circuit_reason=NONE stages_evaluated_mode=FULL"
     counters_window_line = "CountersWindow: from=now-60m to=now"
     consec_line = "ConsecutiveLossesBasis=CLOSED_TRADES streak=0 last_close_ts=- closed_trades_scanned=0"
-    stale_status_line = "StatusSnapshot: stale=False reason=OK"
-    snapshot_coherency_line = "SnapshotCoherency: ACCEPTED source=cycle_complete kind=full"
+    stale_status_line = f"StatusSnapshot: stale={bool(stale_status)} {stale_meta}"
+    src0 = status_obj.get('snapshot_source') if isinstance(status_obj, dict) else None
+    kind0 = status_obj.get('snapshot_kind') if isinstance(status_obj, dict) else None
+    cyc0 = status_obj.get('cycle_id') if isinstance(status_obj, dict) else None
+    if src0 != 'cycle_complete' or kind0 != 'full' or not cyc0:
+        snapshot_coherency_line = f"SnapshotCoherency: REJECTED source={src0} kind={kind0} (control-plane suppressed)"
+    else:
+        snapshot_coherency_line = f"SnapshotCoherency: ACCEPTED source={src0} kind={kind0} cycle_id={cyc0} seq={status_obj.get('status_seq')}"
     churn_top_reasons_line = "none"
     churn_last_events_line = "none"
     penalty_symbols_line = "none"
@@ -466,14 +472,6 @@ def hourly_summary() -> str:
         short_circuit_line = f"short_circuit_reason={sj.get('short_circuit_reason','NONE')} stages_evaluated_mode={sj.get('stages_evaluated_mode','FULL')}"
         if sj.get('short_circuit_reason') == 'COOLDOWN_ACTIVE':
             fetched = int(sj.get('fetched_signals', 0) or 0)
-        stale_status_line = f"StatusSnapshot: stale={bool(stale_status)} {stale_meta}"
-        src = status_obj.get('snapshot_source') if isinstance(status_obj, dict) else None
-        kind = status_obj.get('snapshot_kind') if isinstance(status_obj, dict) else None
-        cyc = status_obj.get('cycle_id') if isinstance(status_obj, dict) else None
-        if src != 'cycle_complete' or kind != 'full' or not cyc:
-            snapshot_coherency_line = f"SnapshotCoherency: REJECTED source={src} kind={kind} (control-plane suppressed)"
-        else:
-            snapshot_coherency_line = f"SnapshotCoherency: ACCEPTED source={src} kind={kind} cycle_id={cyc} seq={status_obj.get('status_seq')}"
         rs = sj.get('risk_state', {}) or {}
         risk_state_line = (
             f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} prev={rs.get('previous_halt_reason') or '-'} "

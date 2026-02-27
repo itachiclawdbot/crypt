@@ -908,3 +908,12 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for status/coherency/queuehealth hardening wave.
+
+---
+
+## 2026-02-27 status/coherency v2 patch (post-review)
+- Fixed stale-line wiring bug where `STALE_STATUS` could remain false when no funnel row existed.
+- Added deterministic stale parser test path confirmation (corrupted status file now yields `StatusSnapshot: stale=True reason=PARSE_ERROR`).
+- Normalized status envelope usage in notifier (`status_obj.payload`), and removed duplicate stale/coherency overrides.
+- Added control-plane suppression when snapshot source is not `cycle_complete/full`.
+- Added explicit CAPACITY_FULL top short-circuit path and heartbeat queue_health envelope payloads.

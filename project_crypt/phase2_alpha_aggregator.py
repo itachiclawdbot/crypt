@@ -2245,7 +2245,50 @@ def run_cycle() -> dict:
         write_status({"snapshot_source": "cycle_complete", "snapshot_kind": "full", "cycle_id": cycle_id, "state": "idle", "job": "cooldown_skip", "last_cycle_summary": summary})
         return summary
 
-    write_status({"state": "running", "job": "ingest_cryptocom"})
+    max_positions_gate = int(os.getenv("PHASE2_MAX_CONCURRENT_NORMAL", "10"))
+    open_positions_gate = _shadow_open_positions_count()
+    if max_positions_gate - open_positions_gate <= 0:
+        summary = {
+            "cycle_id": cycle_id,
+            "discovered_total": 0,
+            "watch_total": 0,
+            "eligible_state_total": 0,
+            "actionable_state_total": 0,
+            "mapped_to_venue_total": 0,
+            "eligible_total": 0,
+            "alpha_pass_total": None,
+            "risk_pass_total": None,
+            "cost_pass_total": None,
+            "proposed_total": 0,
+            "top_reject_reasons": {"RISK_CAPACITY_FULL": 1},
+            "sources_present": {},
+            "rejects_tradable": {"risk": 1},
+            "rejects_external": {},
+            "alpha_scored_total": None,
+            "cost_evaluated_total": None,
+            "risk_evaluated_total": None,
+            "stage_reach": {"scored": None, "costed": None, "cost_pass": None, "risked": None, "sized": None, "actionable": 0},
+            "short_circuit_reason": "CAPACITY_FULL",
+            "stages_evaluated_mode": "SKIPPED",
+            "risk_state": rs_pre,
+            "macro_shock": {"macro_shock": False},
+            "bloodbath_lane": {"active": False, "reason": "CAPACITY_FULL", "activation_reasons": []},
+            "parameter_governor": {"mode": "recommend_only", "suspended": True, "suspend_reasons": ["CAPACITY_FULL"]},
+            "open_positions_basis": "shadow_state",
+            "open_positions": open_positions_gate,
+            "max_positions": max_positions_gate,
+            "remaining_slots": 0,
+            "capacity_admitted": 0,
+            "capacity_rejected": 1,
+            "shadow_attempts": int(drained_exec.get("attempts", 0) or 0),
+            "shadow_fills": int(drained_exec.get("fills", 0) or 0),
+            "shadow_expired": int(drained_exec.get("expired", 0) or 0),
+            "fetched_signals": 0,
+        }
+        write_status({"snapshot_source": "cycle_complete", "snapshot_kind": "full", "cycle_id": cycle_id, "state": "idle", "job": "capacity_skip", "last_cycle_summary": summary})
+        return summary
+
+    write_status({"snapshot_source": "heartbeat", "snapshot_kind": "partial", "state": "running", "job": "ingest_cryptocom"})
     crypto_bases, base_to_instrument = ingest_cryptocom()
 
     write_status({"state": "running", "job": "ingest_cryptocom_movers"})
@@ -3009,7 +3052,6 @@ def run_cycle() -> dict:
         "actionable_top": actionable_top,
     }
 
-    write_status({"state": "idle", "job": "sleeping", "last_cycle_summary": summary})
     return summary
 
 
@@ -3031,9 +3073,14 @@ def rehydrate_shadow_state() -> tuple[bool, str]:
         try:
             with db() as c:
                 cur = c.cursor()
-                cur.execute("select symbol, max(ts) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours') group by symbol")
-                rows = cur.fetchall()
-                SHADOW_STATE['open_positions'] = {str(r[0]): time.time() for r in rows if r[0]}
+                try:
+                    cur.execute("select symbol, max(ts) from shadow_portfolio_ledger where status='OPEN' group by symbol")
+                    rows = cur.fetchall()
+                    SHADOW_STATE['open_positions'] = {str(r[0]): time.time() for r in rows if r[0]}
+                except Exception:
+                    cur.execute("select symbol, max(ts) from shadow_portfolio_ledger where ts >= datetime('now','-24 hours') group by symbol")
+                    rows = cur.fetchall()
+                    SHADOW_STATE['open_positions'] = {str(r[0]): time.time() for r in rows if r[0]}
             return True, 'OK'
         except sqlite3.OperationalError as e:
             if 'locked' in str(e).lower():
@@ -3048,19 +3095,19 @@ def main() -> None:
     init_tables()
     ok_cfg, cfg_reason = validate_boot_config()
     if not ok_cfg:
-        write_status({"state": "fail_closed", "job": "boot_validate", "short_circuit_reason": "CONFIG_INVALID", "error": cfg_reason})
+        write_status({"snapshot_source": "boot", "snapshot_kind": "full", "state": "fail_closed", "job": "boot_validate", "short_circuit_reason": "CONFIG_INVALID", "error": cfg_reason})
         while True:
             time.sleep(30)
     ok_reh, reh_reason = rehydrate_shadow_state()
     if not ok_reh:
-        write_status({"state": "fail_closed", "job": "rehydrate", "short_circuit_reason": "STATE_REHYDRATE_FAILED", "error": reh_reason})
+        write_status({"snapshot_source": "boot", "snapshot_kind": "full", "state": "fail_closed", "job": "rehydrate", "short_circuit_reason": "STATE_REHYDRATE_FAILED", "error": reh_reason})
         while True:
             time.sleep(30)
     tg = TelegramNotifier()
     kill_switch_alerted = False
     startup_ping_sent = False
     last_ghost_run = 0.0
-    write_status({"state": "starting", "job": "boot", "kill_switch_active": is_kill_switch_active()})
+    write_status({"snapshot_source": "boot", "snapshot_kind": "partial", "state": "starting", "job": "boot", "kill_switch_active": is_kill_switch_active()})
     while True:
         if is_kill_switch_active():
             write_status({
