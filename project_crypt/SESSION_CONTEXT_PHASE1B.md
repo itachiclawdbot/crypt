@@ -917,3 +917,30 @@ Operational rule:
 - Normalized status envelope usage in notifier (`status_obj.payload`), and removed duplicate stale/coherency overrides.
 - Added control-plane suppression when snapshot source is not `cycle_complete/full`.
 - Added explicit CAPACITY_FULL top short-circuit path and heartbeat queue_health envelope payloads.
+
+---
+
+## 2026-02-27 deterministic sticky-latch test harness + status v2 contract patch
+1) Implemented test harness
+- Added `PHASE2_STATUS_FREEZE_WRITES` env-gated fault injection in engine status writer.
+- Freeze mode skips status file writes only (engine/DB paths continue running) and logs marker line.
+
+2) StatusSnapshot contract hardening
+- Ensured all status writes use one normalized envelope (`schema_version,status_seq,generated_ts,snapshot_source,snapshot_kind,cycle_id,payload`) via single writer path.
+- Notifier now consumes `status_obj.payload` consistently.
+
+3) Strict parser + sticky latch visibility
+- Notifier stale parser tracks and prints:
+  - stale flag, reason class, last_good_seq, last_read_seq, mtime, size, hash,
+  - stale latch remaining seconds and last parse error ts.
+- stale status is status-channel scoped and shown independently from DB fallback content.
+
+4) Coherency + queue health
+- `SnapshotCoherency` accept/reject gate retained and control-plane suppression enforced on non-cycle_complete snapshots.
+- QueueHealth line remains always visible (real or explicit MISSING).
+
+5) Test execution summary
+- Performed deterministic stale-latch procedure with freeze/corrupt/restore/unfreeze timing sequence to exercise parser and latch path.
+
+6) Git traceability
+- Pending commit for sticky-latch test harness and status v2 visibility patch.

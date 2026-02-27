@@ -16,13 +16,15 @@ STATUS_PATH = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_status
 _LAST_GOOD_STATUS: dict = {}
 _LAST_GOOD_SEQ: int | None = None
 _STALE_UNTIL_TS: float = 0.0
+_LAST_PARSE_ERROR_TS: float = 0.0
+_LAST_READ_SEQ: int | None = None
 DISPLAY_EXCLUDE_BASES = {x.strip().upper() for x in ("USDT,USDC,USD,EUR,PYUSD,TUSD,USDP,BUSD,DAI,FDUSD,USDE,USAT,USD1").split(",") if x.strip()}
 
 
 
 
 def read_status_strict() -> tuple[dict, bool, str]:
-    global _LAST_GOOD_STATUS, _LAST_GOOD_SEQ, _STALE_UNTIL_TS
+    global _LAST_GOOD_STATUS, _LAST_GOOD_SEQ, _STALE_UNTIL_TS, _LAST_PARSE_ERROR_TS, _LAST_READ_SEQ
     now = time.time()
     STALE_LATCH_SEC = 60
     try:
@@ -36,19 +38,25 @@ def read_status_strict() -> tuple[dict, bool, str]:
         meta = f"reason=OK last_good_seq={_LAST_GOOD_SEQ} last_read_seq={obj.get('status_seq')} mtime={STATUS_PATH.stat().st_mtime} size={len(raw)} sha={hash(raw)} source={obj.get('snapshot_source')} cycle_id={obj.get('cycle_id')}"
         return obj, stale, meta
     except FileNotFoundError:
+        _LAST_PARSE_ERROR_TS = now
         _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
-        return (_LAST_GOOD_STATUS or {}), True, f"reason=MISSING last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA"
+        rem=max(0,int(_STALE_UNTIL_TS-now))
+        return (_LAST_GOOD_STATUS or {}), True, f"reason=MISSING last_good_seq={_LAST_GOOD_SEQ} last_read_seq={_LAST_READ_SEQ or 'NA'} stale_latch_remaining_s={rem} last_parse_error_ts={_LAST_PARSE_ERROR_TS}"
     except json.JSONDecodeError:
+        _LAST_PARSE_ERROR_TS = now
         _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
+        rem=max(0,int(_STALE_UNTIL_TS-now))
         try:
             st = STATUS_PATH.stat()
             raw = STATUS_PATH.read_bytes()
-            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA mtime={st.st_mtime} size={st.st_size} sha={hash(raw)}"
+            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq={_LAST_READ_SEQ or 'NA'} mtime={st.st_mtime} size={st.st_size} sha={hash(raw)} stale_latch_remaining_s={rem} last_parse_error_ts={_LAST_PARSE_ERROR_TS}"
         except Exception:
-            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA"
+            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq={_LAST_READ_SEQ or 'NA'} stale_latch_remaining_s={rem} last_parse_error_ts={_LAST_PARSE_ERROR_TS}"
     except Exception as e:
+        _LAST_PARSE_ERROR_TS = now
         _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
-        return (_LAST_GOOD_STATUS or {}), True, f"reason=IO last_good_seq={_LAST_GOOD_SEQ} err={type(e).__name__}"
+        rem=max(0,int(_STALE_UNTIL_TS-now))
+        return (_LAST_GOOD_STATUS or {}), True, f"reason=IO last_good_seq={_LAST_GOOD_SEQ} last_read_seq={_LAST_READ_SEQ or 'NA'} err={type(e).__name__} stale_latch_remaining_s={rem} last_parse_error_ts={_LAST_PARSE_ERROR_TS}"
 
 def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)

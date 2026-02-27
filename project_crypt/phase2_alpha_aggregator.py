@@ -21,6 +21,7 @@ POLL_SECONDS = int(os.getenv("PHASE2_POLL_SECONDS", "300"))
 STATUS_PATH = os.getenv("PHASE2_STATUS_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
 STATUS_SCHEMA_VERSION = 2
 STATUS_SEQ = 0
+PHASE2_STATUS_FREEZE_WRITES = str(os.getenv("PHASE2_STATUS_FREEZE_WRITES","0")).lower() in {"1","true","yes","on"}
 
 EXECUTION_INTENT_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=2000)
 EXECUTION_RESULTS_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=4000)
@@ -171,6 +172,9 @@ def write_status(payload: dict) -> None:
         "cycle_id": cycle_id,
         "payload": payload,
     }
+    if PHASE2_STATUS_FREEZE_WRITES:
+        print("STATUS_FREEZE_WRITES=ON (skipping status write)")
+        return
     tmp = STATUS_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(env, f, indent=2)
