@@ -882,3 +882,29 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for nervous-system hardening wave.
+
+---
+
+## 2026-02-27 status-channel + coherency + queuehealth hardening wave
+1) Status channel contract
+- `write_status` now emits normalized envelope:
+  - `schema_version`, `status_seq`, `generated_ts`, `snapshot_source`, `snapshot_kind`, `cycle_id`, `payload`
+- Atomic tmp+rename retained.
+
+2) Notifier strict status health channel
+- Added strict status parser with stale-latch state.
+- Digest now always prints `StatusSnapshot` and `SnapshotCoherency` lines separately from business metrics.
+- Control-plane lines are suppressed when latest snapshot is not coherent `cycle_complete/full`.
+
+3) QueueHealth visibility
+- Added heartbeat/fast-tick queue_health payload and always-on `QueueHealth` digest line (or explicit MISSING).
+- Queue backpressure/drain telemetry remains in cycle payload.
+
+4) Boot/rehydrate hardening
+- Added boot fail-closed validation and rehydrate function with bounded retry and WAL busy_timeout path.
+
+5) Validation
+- Compile checks passed, services restarted, forced telegram send OK.
+
+6) Git traceability
+- Pending commit for status/coherency/queuehealth hardening wave.

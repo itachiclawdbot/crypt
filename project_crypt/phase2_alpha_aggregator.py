@@ -158,13 +158,22 @@ def db() -> sqlite3.Connection:
 def write_status(payload: dict) -> None:
     global STATUS_SEQ
     STATUS_SEQ += 1
-    payload["ts"] = utc_now()
-    payload["schema_version"] = STATUS_SCHEMA_VERSION
-    payload["status_seq"] = STATUS_SEQ
-    payload["generated_ts"] = utc_now()
+    generated = utc_now()
+    snapshot_source = str(payload.pop("snapshot_source", "heartbeat"))
+    snapshot_kind = str(payload.pop("snapshot_kind", "partial"))
+    cycle_id = payload.get("cycle_id")
+    env = {
+        "schema_version": STATUS_SCHEMA_VERSION,
+        "status_seq": STATUS_SEQ,
+        "generated_ts": generated,
+        "snapshot_source": snapshot_source,
+        "snapshot_kind": snapshot_kind,
+        "cycle_id": cycle_id,
+        "payload": payload,
+    }
     tmp = STATUS_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(env, f, indent=2)
     os.replace(tmp, STATUS_PATH)
 
 
@@ -2191,6 +2200,7 @@ def run_cycle() -> dict:
             health_rows = [{"source": str(r[0]), "status": str(r[1]), "count": int(r[2] or 0)} for r in cur.fetchall()]
 
         summary = {
+            "cycle_id": cycle_id,
             "discovered_total": 0,
             "watch_total": 0,
             "eligible_state_total": 0,
@@ -2232,7 +2242,7 @@ def run_cycle() -> dict:
             "source_health_ping": health_rows,
             "fetched_signals": 0,
         }
-        write_status({"state": "idle", "job": "cooldown_skip", "last_cycle_summary": summary})
+        write_status({"snapshot_source": "cycle_complete", "snapshot_kind": "full", "cycle_id": cycle_id, "state": "idle", "job": "cooldown_skip", "last_cycle_summary": summary})
         return summary
 
     write_status({"state": "running", "job": "ingest_cryptocom"})
@@ -2940,6 +2950,7 @@ def run_cycle() -> dict:
     )
 
     summary = {
+        "cycle_id": cycle_id,
         "discovered_total": len(discovered),
         "watch_total": len(watch_rows),
         "eligible_state_total": len(eligible_rows),
@@ -3083,6 +3094,9 @@ def main() -> None:
                 put_signal(None, Source.SYSTEM, "ghost_sim_hourly", ghost)
                 last_ghost_run = time.time()
             write_status({
+                "snapshot_source": "cycle_complete",
+                "snapshot_kind": "full",
+                "cycle_id": summary.get("cycle_id"),
                 "state": "cycle_complete",
                 "job": "sleeping",
                 "last_cycle_seconds": round(time.time() - t0, 2),
@@ -3100,10 +3114,24 @@ def main() -> None:
         next_discovery_tick = time.time() + max(30, DISCOVERY_TICK_SECONDS)
 
         write_status({
+            "snapshot_source": "heartbeat",
+            "snapshot_kind": "partial",
             "state": "sleeping",
             "job": "waiting_next_cycle",
             "sleep_for": cycle_wait,
             "kill_switch_active": False,
+            "queue_health": {
+                "queue_intents_depth": EXECUTION_INTENT_QUEUE.qsize(),
+                "queue_results_depth": EXECUTION_RESULTS_QUEUE.qsize(),
+                "queue_intents_capacity": 2000,
+                "queue_results_capacity": 4000,
+                "queue_drain_ms_last": 0.0,
+                "queue_drain_items_last": 0,
+                "queue_backpressure_active": False,
+                "queue_drop_count": 0,
+                "worker_alive": True,
+                "queue_telemetry_ts": utc_now(),
+            },
             "next_market_tick_s": MARKET_TICK_SECONDS,
             "next_discovery_tick_s": DISCOVERY_TICK_SECONDS,
         })
@@ -3115,7 +3143,7 @@ def main() -> None:
             now = time.time()
             if now >= next_market_tick:
                 try:
-                    write_status({"state": "running", "job": "market_fast_tick", "kill_switch_active": False})
+                    write_status({"snapshot_source": "fast_tick", "snapshot_kind": "partial", "state": "running", "job": "market_fast_tick", "kill_switch_active": False, "queue_health": {"queue_intents_depth": EXECUTION_INTENT_QUEUE.qsize(), "queue_results_depth": EXECUTION_RESULTS_QUEUE.qsize(), "queue_intents_capacity": 2000, "queue_results_capacity": 4000, "queue_drain_ms_last": 0.0, "queue_drain_items_last": 0, "queue_backpressure_active": False, "queue_drop_count": 0, "worker_alive": True, "queue_telemetry_ts": utc_now()}})
                     symbols = ingest_cryptocom()
                     put_signal(None, Source.SYSTEM, "market_fast_tick", {"symbols": len(symbols)})
                 except Exception as e:
@@ -3124,7 +3152,7 @@ def main() -> None:
 
             if now >= next_discovery_tick:
                 try:
-                    write_status({"state": "running", "job": "discovery_fast_tick", "kill_switch_active": False})
+                    write_status({"snapshot_source": "fast_tick", "snapshot_kind": "partial", "state": "running", "job": "discovery_fast_tick", "kill_switch_active": False, "queue_health": {"queue_intents_depth": EXECUTION_INTENT_QUEUE.qsize(), "queue_results_depth": EXECUTION_RESULTS_QUEUE.qsize(), "queue_intents_capacity": 2000, "queue_results_capacity": 4000, "queue_drain_ms_last": 0.0, "queue_drain_items_last": 0, "queue_backpressure_active": False, "queue_drop_count": 0, "worker_alive": True, "queue_telemetry_ts": utc_now()}})
                     cg = ingest_coingecko()
                     dex_latest, dex_boosted, _ = ingest_dex()
                     news_hits = ingest_news()

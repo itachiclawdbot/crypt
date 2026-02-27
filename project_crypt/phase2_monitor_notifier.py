@@ -14,27 +14,41 @@ NOTIFIER_LOG = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_monit
 NOTIFIER_HEARTBEAT = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_notifier_heartbeat.json")
 STATUS_PATH = Path("/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
 _LAST_GOOD_STATUS: dict = {}
+_LAST_GOOD_SEQ: int | None = None
+_STALE_UNTIL_TS: float = 0.0
 DISPLAY_EXCLUDE_BASES = {x.strip().upper() for x in ("USDT,USDC,USD,EUR,PYUSD,TUSD,USDP,BUSD,DAI,FDUSD,USDE,USAT,USD1").split(",") if x.strip()}
 
 
 
 
 def read_status_strict() -> tuple[dict, bool, str]:
-    global _LAST_GOOD_STATUS
+    global _LAST_GOOD_STATUS, _LAST_GOOD_SEQ, _STALE_UNTIL_TS
+    now = time.time()
+    STALE_LATCH_SEC = 60
     try:
-        raw = STATUS_PATH.read_text(encoding='utf-8')
-        obj = json.loads(raw)
+        raw = STATUS_PATH.read_bytes()
+        obj = json.loads(raw.decode('utf-8'))
         if not isinstance(obj, dict) or 'schema_version' not in obj or 'status_seq' not in obj:
-            raise ValueError('status_schema_invalid')
+            raise ValueError('SCHEMA_ERROR')
         _LAST_GOOD_STATUS = obj
-        return obj, False, ''
-    except Exception as e:
+        _LAST_GOOD_SEQ = int(obj.get('status_seq') or 0)
+        stale = now < _STALE_UNTIL_TS
+        meta = f"reason=OK last_good_seq={_LAST_GOOD_SEQ} last_read_seq={obj.get('status_seq')} mtime={STATUS_PATH.stat().st_mtime} size={len(raw)} sha={hash(raw)} source={obj.get('snapshot_source')} cycle_id={obj.get('cycle_id')}"
+        return obj, stale, meta
+    except FileNotFoundError:
+        _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
+        return (_LAST_GOOD_STATUS or {}), True, f"reason=MISSING last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA"
+    except json.JSONDecodeError:
+        _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
         try:
             st = STATUS_PATH.stat()
-            meta = f"hash={hash(STATUS_PATH.read_text(encoding='utf-8', errors='ignore'))} mtime={st.st_mtime} size={st.st_size} err={type(e).__name__}"
+            raw = STATUS_PATH.read_bytes()
+            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA mtime={st.st_mtime} size={st.st_size} sha={hash(raw)}"
         except Exception:
-            meta = f"err={type(e).__name__}"
-        return (_LAST_GOOD_STATUS or {}), True, meta
+            return (_LAST_GOOD_STATUS or {}), True, f"reason=PARSE_ERROR last_good_seq={_LAST_GOOD_SEQ} last_read_seq=NA"
+    except Exception as e:
+        _STALE_UNTIL_TS = max(_STALE_UNTIL_TS, now + STALE_LATCH_SEC)
+        return (_LAST_GOOD_STATUS or {}), True, f"reason=IO last_good_seq={_LAST_GOOD_SEQ} err={type(e).__name__}"
 
 def db() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)
@@ -114,6 +128,7 @@ def _periodic_analysis(cur: sqlite3.Cursor, since_ts: str, limit: int, label: st
 def hourly_summary() -> str:
     now = datetime.now(timezone.utc)
     status_obj, stale_status, stale_meta = read_status_strict()
+    status_payload = status_obj.get('payload', status_obj) if isinstance(status_obj, dict) else {}
     since = (now - timedelta(hours=1)).isoformat()
     since_6h = (now - timedelta(hours=6)).isoformat()
     with db() as c:
@@ -387,20 +402,22 @@ def hourly_summary() -> str:
     capacity_line = "Capacity admitted=0 capacity_rejected=0"
     shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0 avg_fill_latency_sec=NA min_fill_delay_cycles=NA"
     shadow_timing_line = "ShadowExecTiming: fills_count=0 min_fill_delay_cycles=NA avg_fill_latency_sec=NA"
+    queue_health_line = "QueueHealth: MISSING queue_telemetry_missing=true"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0 p5=0.0 mean=0.0 hit=0.00 valid_rate=0.00 invalid_rows=0 class_counts={}"
     capacity_admitted_top_line = "CapacityAdmittedTop=[]"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
     short_circuit_line = "short_circuit_reason=NONE stages_evaluated_mode=FULL"
     counters_window_line = "CountersWindow: from=now-60m to=now"
     consec_line = "ConsecutiveLossesBasis=CLOSED_TRADES streak=0 last_close_ts=- closed_trades_scanned=0"
-    stale_status_line = "STALE_STATUS=False"
+    stale_status_line = "StatusSnapshot: stale=False reason=OK"
+    snapshot_coherency_line = "SnapshotCoherency: ACCEPTED source=cycle_complete kind=full"
     churn_top_reasons_line = "none"
     churn_last_events_line = "none"
     penalty_symbols_line = "none"
     sources_present_txt = "{}"
 
-    if not funnel and isinstance(status_obj.get('last_cycle_summary'), dict):
-        ls = status_obj.get('last_cycle_summary') or {}
+    if not funnel and isinstance(status_payload.get('last_cycle_summary'), dict):
+        ls = status_payload.get('last_cycle_summary') or {}
         funnel = {
             "discovered_total": ls.get("discovered_total", 0),
             "mapped_to_venue_total": ls.get("mapped_to_venue_total", 0),
@@ -418,7 +435,7 @@ def hourly_summary() -> str:
             "sanity_json": json.dumps(ls),
             "regime": (ls.get("macro_shock") or {}).get("regime", "NORMAL"),
             "pressure_count": 0,
-            "ts": status_obj.get("ts", "-"),
+            "ts": status_payload.get("ts", status_obj.get("generated_ts", "-")),
         }
 
     if funnel:
@@ -449,7 +466,14 @@ def hourly_summary() -> str:
         short_circuit_line = f"short_circuit_reason={sj.get('short_circuit_reason','NONE')} stages_evaluated_mode={sj.get('stages_evaluated_mode','FULL')}"
         if sj.get('short_circuit_reason') == 'COOLDOWN_ACTIVE':
             fetched = int(sj.get('fetched_signals', 0) or 0)
-        stale_status_line = f"STALE_STATUS={bool(stale_status)} {stale_meta}" if stale_status else "STALE_STATUS=False"
+        stale_status_line = f"StatusSnapshot: stale={bool(stale_status)} {stale_meta}"
+        src = status_obj.get('snapshot_source') if isinstance(status_obj, dict) else None
+        kind = status_obj.get('snapshot_kind') if isinstance(status_obj, dict) else None
+        cyc = status_obj.get('cycle_id') if isinstance(status_obj, dict) else None
+        if src != 'cycle_complete' or kind != 'full' or not cyc:
+            snapshot_coherency_line = f"SnapshotCoherency: REJECTED source={src} kind={kind} (control-plane suppressed)"
+        else:
+            snapshot_coherency_line = f"SnapshotCoherency: ACCEPTED source={src} kind={kind} cycle_id={cyc} seq={status_obj.get('status_seq')}"
         rs = sj.get('risk_state', {}) or {}
         risk_state_line = (
             f"halted={bool(rs.get('halted', False))} reason={rs.get('halt_reason') or '-'} prev={rs.get('previous_halt_reason') or '-'} "
@@ -488,6 +512,14 @@ def hourly_summary() -> str:
             avg_latency_txt = f"{float(avg_latency or 0.0):.3f}"
         shadow_exec_line = f"shadow_attempts={attempt_60m} shadow_fills={exec_60m} shadow_expired={expired_60m} avg_fill_latency_sec={avg_latency_txt} min_fill_delay_cycles={min_delay_txt} q_intents={int(sj.get('queue_intents_depth',0) or 0)} q_results={int(sj.get('queue_results_depth',0) or 0)} drain_ms={float(sj.get('queue_drain_ms',0.0) or 0.0):.2f} backpressure={bool(sj.get('queue_backpressure',False))}"
         shadow_timing_line = f"ShadowExecTiming: fills_count={fills_count} min_fill_delay_cycles={min_delay_txt} avg_fill_latency_sec={avg_latency_txt}"
+        qh = (status_payload.get('queue_health') or {}) if isinstance(status_payload, dict) else {}
+        if qh:
+            queue_health_line = (
+                f"QueueHealth: intents={qh.get('queue_intents_depth')} results={qh.get('queue_results_depth')} "
+                f"cap_i={qh.get('queue_intents_capacity')} cap_r={qh.get('queue_results_capacity')} "
+                f"drain_ms={qh.get('queue_drain_ms_last')} drained={qh.get('queue_drain_items_last')} "
+                f"backpressure={qh.get('queue_backpressure_active')} worker_alive={qh.get('worker_alive')}"
+            )
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         class_counts = gm.get('class_counts', {}) if isinstance(gm, dict) else {}
@@ -517,6 +549,12 @@ def hourly_summary() -> str:
             bottleneck_6h = "RISK_HALT"
             periodic_reco = "Global risk halt dominates; fix RiskState/churn/loss machine before tuning alpha/cost thresholds."
 
+    if snapshot_coherency_line.startswith("SnapshotCoherency: REJECTED"):
+        openpos_line = "OpenPositions: SUPPRESSED"
+        capacity_line = "Capacity: SUPPRESSED"
+        shadow_exec_line = "ShadowExec: SUPPRESSED"
+        dd_line = "DDState: SUPPRESSED"
+
     cliff_hint = "none"
     if short_circuit_line.startswith("short_circuit_reason=CAPACITY_FULL"):
         cliff_hint = "Capacity short-circuit: downstream stages skipped (not a cost cliff)."
@@ -538,6 +576,8 @@ def hourly_summary() -> str:
         f"{shadow_timing_line}\n"
         f"Window: last 1h\n"
         f"{stale_status_line}\n"
+        f"{snapshot_coherency_line}\n"
+        f"{queue_health_line}\n"
         f"Fetched signals: {fetched}\n"
         f"By source: {src_txt}\n"
         f"Trend signals: {sig_txt}\n"
