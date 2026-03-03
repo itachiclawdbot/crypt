@@ -944,3 +944,38 @@ Operational rule:
 
 6) Git traceability
 - Pending commit for sticky-latch test harness and status v2 visibility patch.
+
+---
+
+## 2026-03-03 Layer-2 data ingestion hardening wave
+1) Decision / contract changes
+- Added deterministic ingestion bundle payload in cycle summary with explicit request counters split:
+  - `signals_requests` and `marketdata_requests` (totals + by_source)
+- Added freshness counters (`stale_count`, `time_skew_count`) and mapping overflow accounting.
+- Added mapping explosion cap guard (`INGEST_MAPPING_K`, `INGEST_CARRYOVER_CAP`) with overflow clipping and telemetry.
+
+2) Routing/flow updates
+- Ingestion call path now initializes per-cycle ingestion counters and tags request bucket/source around signal and marketdata fetch phases.
+- `get_json` path marks started/completed/failed counters when ingestion tag is active.
+- Cooldown skip summary now emits deterministic ingestion bundle (skipped reason = COOLDOWN_ACTIVE).
+
+3) Deterministic schema output
+- Summary now carries `ingestion_bundle` with required keys:
+  - cycle_id, signals_universe, marketdata_bundle, ingestion_health_this_cycle, request counters,
+    ingestion_latency_ms, budget, mapping stats, skipped reason, schema violation flags.
+
+4) Observability
+- Hourly digest now includes ingestion section lines:
+  - SignalsRequests
+  - MarketdataRequests
+  - Freshness
+  - Mapping
+  - IngestionLatency
+
+5) Validation
+- Python compile checks passed.
+- Services restarted.
+- Forced Telegram send executed after deployment.
+
+6) Git traceability
+- Pending commit for Layer-2 hardening wave.

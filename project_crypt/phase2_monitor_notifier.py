@@ -411,6 +411,11 @@ def hourly_summary() -> str:
     shadow_exec_line = "shadow_attempts=0 shadow_fills=0 shadow_expired=0 avg_fill_latency_sec=NA min_fill_delay_cycles=NA"
     shadow_timing_line = "ShadowExecTiming: fills_count=0 min_fill_delay_cycles=NA avg_fill_latency_sec=NA"
     queue_health_line = "QueueHealth: MISSING queue_telemetry_missing=true"
+    signals_req_line = "SignalsRequests: started=0 completed=0 failed=0 by_source={}"
+    market_req_line = "MarketdataRequests: started=0 completed=0 failed=0 by_source={}"
+    freshness_line = "Freshness: stale_count=0 time_skew_count=0"
+    mapping_line = "Mapping: discovered=0 resolved=0 carryover=0 overflow=0"
+    ingest_latency_line = "IngestionLatency: ms=0.0 budget=0.0"
     governor_line = "mode=recommend_only suspended=True reasons=[] n=0 p5=0.0 mean=0.0 hit=0.00 valid_rate=0.00 invalid_rows=0 class_counts={}"
     capacity_admitted_top_line = "CapacityAdmittedTop=[]"
     churn_diag_line = "attempt5m=0 attempt60m=0 exec5m=0 exec60m=0 penalty_symbols=0 hot_loop=False suspect=False"
@@ -526,6 +531,16 @@ def hourly_summary() -> str:
                 f"drain_ms={qh.get('queue_drain_ms_last')} drained={qh.get('queue_drain_items_last')} "
                 f"backpressure={qh.get('queue_backpressure_active')} worker_alive={qh.get('worker_alive')}"
             )
+        ib = sj.get('ingestion_bundle', {}) or {}
+        sr = ib.get('signals_requests', {}) or {}
+        mr = ib.get('marketdata_requests', {}) or {}
+        sf = (ib.get('ingestion_health_this_cycle', {}) or {}).get('freshness', {}) or {}
+        mp = ib.get('mapping_stats', {}) or {}
+        signals_req_line = f"SignalsRequests: started={((sr.get('totals',{}) or {}).get('started_total',0)} completed={((sr.get('totals',{}) or {}).get('completed_total',0)} failed={((sr.get('totals',{}) or {}).get('failed_total',0)} by_source={(sr.get('by_source',{}) or {})}"
+        market_req_line = f"MarketdataRequests: started={((mr.get('totals',{}) or {}).get('started_total',0)} completed={((mr.get('totals',{}) or {}).get('completed_total',0)} failed={((mr.get('totals',{}) or {}).get('failed_total',0)} by_source={(mr.get('by_source',{}) or {})}"
+        freshness_line = f"Freshness: stale_count={sf.get('stale_count',0)} time_skew_count={sf.get('time_skew_count',0)}"
+        mapping_line = f"Mapping: discovered={mp.get('discovered_symbols',0)} resolved={mp.get('resolved_instruments',0)} carryover={mp.get('carryover_symbols',0)} overflow={mp.get('overflow',0)}"
+        ingest_latency_line = f"IngestionLatency: ms={float(ib.get('ingestion_latency_ms',0.0) or 0.0):.2f} budget={float(ib.get('ingestion_budget_ms',0.0) or 0.0):.2f}"
         gov = sj.get('parameter_governor', {}) or {}
         gm = gov.get('metrics', {}) or {}
         class_counts = gm.get('class_counts', {}) if isinstance(gm, dict) else {}
@@ -585,6 +600,11 @@ def hourly_summary() -> str:
         f"{snapshot_coherency_line}\n"
         f"{queue_health_line}\n"
         f"Fetched signals: {fetched}\n"
+        f"{signals_req_line}\n"
+        f"{market_req_line}\n"
+        f"{freshness_line}\n"
+        f"{mapping_line}\n"
+        f"{ingest_latency_line}\n"
         f"By source: {src_txt}\n"
         f"Trend signals: {sig_txt}\n"
         f"Trending symbols: {sym_txt}\n"

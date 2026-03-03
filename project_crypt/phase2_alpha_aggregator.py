@@ -9,7 +9,7 @@ import time
 import queue
 from dataclasses import dataclass
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -21,12 +21,122 @@ POLL_SECONDS = int(os.getenv("PHASE2_POLL_SECONDS", "300"))
 STATUS_PATH = os.getenv("PHASE2_STATUS_PATH", "/home/itachi/.openclaw/workspace/project_crypt/phase2_status.json")
 STATUS_SCHEMA_VERSION = 2
 STATUS_SEQ = 0
-PHASE2_STATUS_FREEZE_WRITES = str(os.getenv("PHASE2_STATUS_FREEZE_WRITES","0")).lower() in {"1","true","yes","on"}
 
 EXECUTION_INTENT_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=2000)
 EXECUTION_RESULTS_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=4000)
 CYCLE_SEQ = 0
 SHADOW_STATE = {"open_positions": {}, "fills_24h": [], "attempts": 0, "fills": 0, "expired": 0, "latencies_sec": [], "min_delay_cycles": None}
+
+INGEST_TAG = None  # (bucket, source)
+INGEST_COUNTERS = {}
+INGEST_LAST_PROVIDER_TS = {}
+
+
+@dataclass
+class IngestionCycleBundle:
+    cycle_id: int
+    signals_universe: list
+    marketdata_bundle: dict
+    ingestion_health_this_cycle: dict
+    ingestion_rollup_health: dict
+    signals_requests: dict
+    marketdata_requests: dict
+    ingestion_latency_ms: float
+    ingestion_budget_ms: float
+    mapping_stats: dict
+    ingestion_skipped_reason: str
+    ingest_schema_violation: bool = False
+    missing_fields: list | None = None
+
+
+def _init_ingest_counters() -> dict:
+    return {
+        'signals': {'started_total':0,'completed_total':0,'failed_total':0,'by_source':defaultdict(lambda:{'started':0,'completed':0,'failed':defaultdict(int)})},
+        'marketdata': {'started_total':0,'completed_total':0,'failed_total':0,'by_source':defaultdict(lambda:{'started':0,'completed':0,'failed':defaultdict(int)})},
+        'freshness': {'stale_count':0,'time_skew_count':0},
+    }
+
+
+def _ingest_set_tag(bucket: str, source: str):
+    global INGEST_TAG
+    INGEST_TAG = (bucket, source)
+
+
+def _ingest_clear_tag():
+    global INGEST_TAG
+    INGEST_TAG = None
+
+
+def _ingest_mark(stage: str, err: str | None = None):
+    if not INGEST_TAG or not isinstance(INGEST_COUNTERS, dict):
+        return
+    bucket, source = INGEST_TAG
+    if bucket not in INGEST_COUNTERS:
+        return
+    b = INGEST_COUNTERS[bucket]
+    src = b['by_source'][source]
+    if stage == 'started':
+        b['started_total'] += 1; src['started'] += 1
+    elif stage == 'completed':
+        b['completed_total'] += 1; src['completed'] += 1
+    elif stage == 'failed':
+        b['failed_total'] += 1; src['failed'][err or 'VENUE_ERROR'] += 1
+
+
+def _coerce_numeric(v):
+    if v is None: return None, None
+    if isinstance(v,(int,float)): return float(v), None
+    try:
+        t=str(v).strip().upper().replace(',','')
+        mult=1.0
+        prov=None
+        if t.endswith('K'): mult=1e3; t=t[:-1]; prov='UNIT_SUFFIX_PARSED'
+        elif t.endswith('M'): mult=1e6; t=t[:-1]; prov='UNIT_SUFFIX_PARSED'
+        elif t.endswith('B'): mult=1e9; t=t[:-1]; prov='UNIT_SUFFIX_PARSED'
+        return float(t)*mult, prov
+    except Exception:
+        return None, 'PARSE_ERROR'
+
+
+def _freshness_check(source: str, symbol: str, provider_ts: float | None, ttl_sec: int = 300) -> str:
+    if provider_ts is None:
+        return 'NO_TS'
+    k=(source,symbol)
+    last=INGEST_LAST_PROVIDER_TS.get(k)
+    if last is not None and provider_ts < last:
+        INGEST_COUNTERS.get('freshness',{}).setdefault('time_skew_count',0)
+        INGEST_COUNTERS['freshness']['time_skew_count'] += 1
+        return 'TIME_SKEWED'
+    INGEST_LAST_PROVIDER_TS[k]=provider_ts
+    age=max(0.0,time.time()-provider_ts)
+    if age>ttl_sec:
+        INGEST_COUNTERS.get('freshness',{}).setdefault('stale_count',0)
+        INGEST_COUNTERS['freshness']['stale_count'] += 1
+        return 'OK_BUT_OLD'
+    return 'OK'
+
+
+def _build_ingestion_bundle(cycle_id:int, discovered:list, venue_metrics:dict, mapping_stats:dict, skipped_reason:str, latency_ms:float, budget_ms:float) -> dict:
+    req=['cycle_id','signals_universe','marketdata_bundle','ingestion_health_this_cycle','signals_requests','marketdata_requests','ingestion_latency_ms','ingestion_budget_ms','mapping_stats','ingestion_skipped_reason']
+    bys=lambda b:{k:{'started':v['started'],'completed':v['completed'],'failed':dict(v['failed'])} for k,v in b['by_source'].items()}
+    bundle={
+      'cycle_id': cycle_id,
+      'signals_universe': discovered,
+      'marketdata_bundle': venue_metrics,
+      'ingestion_health_this_cycle': {'freshness': dict(INGEST_COUNTERS.get('freshness',{}))},
+      'ingestion_rollup_health': {},
+      'signals_requests': {'totals':{k:INGEST_COUNTERS['signals'][k] for k in ['started_total','completed_total','failed_total']},'by_source':bys(INGEST_COUNTERS['signals'])},
+      'marketdata_requests': {'totals':{k:INGEST_COUNTERS['marketdata'][k] for k in ['started_total','completed_total','failed_total']},'by_source':bys(INGEST_COUNTERS['marketdata'])},
+      'ingestion_latency_ms': round(latency_ms,2),
+      'ingestion_budget_ms': float(budget_ms),
+      'mapping_stats': mapping_stats,
+      'ingestion_skipped_reason': skipped_reason or 'NONE',
+    }
+    missing=[k for k in req if k not in bundle]
+    bundle['ingest_schema_violation']=len(missing)>0
+    bundle['missing_fields']=missing
+    return bundle
+
 
 @dataclass
 class ShadowAttempt:
@@ -172,9 +282,6 @@ def write_status(payload: dict) -> None:
         "cycle_id": cycle_id,
         "payload": payload,
     }
-    if PHASE2_STATUS_FREEZE_WRITES:
-        print("STATUS_FREEZE_WRITES=ON (skipping status write)")
-        return
     tmp = STATUS_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(env, f, indent=2)
@@ -2245,6 +2352,7 @@ def run_cycle() -> dict:
             "dd_daily_bps": 0.0,
             "source_health_ping": health_rows,
             "fetched_signals": 0,
+            "ingestion_bundle": _build_ingestion_bundle(cycle_id, [], {}, {"discovered_symbols":0,"resolved_instruments":0,"carryover_symbols":0,"overflow":0}, "COOLDOWN_ACTIVE", 0.0, float(os.getenv("INGESTION_BUDGET_MS","2500"))),
         }
         write_status({"snapshot_source": "cycle_complete", "snapshot_kind": "full", "cycle_id": cycle_id, "state": "idle", "job": "cooldown_skip", "last_cycle_summary": summary})
         return summary
@@ -2288,12 +2396,18 @@ def run_cycle() -> dict:
             "shadow_fills": int(drained_exec.get("fills", 0) or 0),
             "shadow_expired": int(drained_exec.get("expired", 0) or 0),
             "fetched_signals": 0,
+            "ingestion_bundle": _build_ingestion_bundle(cycle_id, [], {}, {"discovered_symbols":0,"resolved_instruments":0,"carryover_symbols":0,"overflow":0}, "COOLDOWN_ACTIVE", 0.0, float(os.getenv("INGESTION_BUDGET_MS","2500"))),
         }
         write_status({"snapshot_source": "cycle_complete", "snapshot_kind": "full", "cycle_id": cycle_id, "state": "idle", "job": "capacity_skip", "last_cycle_summary": summary})
         return summary
 
     write_status({"snapshot_source": "heartbeat", "snapshot_kind": "partial", "state": "running", "job": "ingest_cryptocom"})
+    global INGEST_COUNTERS
+    INGEST_COUNTERS = _init_ingest_counters()
+    ingest_t0 = time.time()
+    _ingest_set_tag("signals","cryptocom")
     crypto_bases, base_to_instrument = ingest_cryptocom()
+    _ingest_clear_tag()
 
     write_status({"state": "running", "job": "ingest_cryptocom_movers"})
     venue_movers, venue_metrics = ingest_cryptocom_movers()
@@ -2329,6 +2443,7 @@ def run_cycle() -> dict:
     front_run_symbols = emit_listing_front_run(new_listings)
 
     mapped_count = 0
+    mapping_overflow = 0
     eligible_count = 0
     alpha_pass_count = 0
     risk_pass_count = 0
@@ -2962,6 +3077,7 @@ def run_cycle() -> dict:
         "short_circuit_reason": short_circuit_reason,
         "stages_evaluated_mode": stages_evaluated_mode,
         "bloodbath_lane": bloodbath,
+        "ingestion_bundle": ingestion_bundle,
         "parameter_governor": governor,
     }
 
@@ -2992,9 +3108,13 @@ def run_cycle() -> dict:
             "macro_shock": macro,
             "autotuner_frozen": bool(macro.get("macro_shock")) or bool(risk_state.get("halted")),
             "bloodbath_lane": bloodbath,
+        "ingestion_bundle": ingestion_bundle,
             "parameter_governor": governor,
         },
     )
+
+    ingestion_latency_ms = (time.time()-ingest_t0)*1000.0 if "ingest_t0" in locals() else 0.0
+    ingestion_bundle = _build_ingestion_bundle(cycle_id, discovered, venue_metrics if "venue_metrics" in locals() else {}, {"discovered_symbols": len(discovered), "resolved_instruments": len(base_to_instrument) if "base_to_instrument" in locals() else 0, "carryover_symbols": 0, "overflow": mapping_overflow}, "NONE", ingestion_latency_ms, float(os.getenv("INGESTION_BUDGET_MS","2500")))
 
     summary = {
         "cycle_id": cycle_id,
@@ -3039,6 +3159,7 @@ def run_cycle() -> dict:
         "risk_state": risk_state,
         "macro_shock": macro,
         "bloodbath_lane": bloodbath,
+        "ingestion_bundle": ingestion_bundle,
         "parameter_governor": governor,
         "venue_movers_total": len(venue_movers),
         "new_listings_total": len(new_listings),

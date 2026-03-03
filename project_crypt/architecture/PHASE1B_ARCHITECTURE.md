@@ -224,3 +224,8 @@ Phase-1B design docs:
 ### 2026-02-27 status-channel health v2
 - Status parse health is now independent from DB-rendered digest content and always surfaced via `StatusSnapshot`.
 - Coherency gate suppresses control-plane render when latest snapshot is not `cycle_complete/full`.
+
+### 2026-03-03 Layer-2 ingestion contract additions
+- Added per-cycle ingestion bundle contract attached to cycle summary payload.
+- Request accounting split by domain (signals vs marketdata) with per-source counters.
+- Added freshness/time-skew and mapping-overflow telemetry to ingestion output.
